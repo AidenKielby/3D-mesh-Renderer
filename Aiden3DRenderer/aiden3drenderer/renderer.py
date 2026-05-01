@@ -2776,13 +2776,13 @@ class Renderer3D:
             if texture_index is None or texture_index < 0 or texture_index >= len(layers):
                 tex = None
             else:
-                tex = layers[texture_index]
+                tex = layers[int(texture_index)]
         if tex is None:
             return None
 
         h, w = tex.shape[:2]
-        uu = max(0.0, min(1.0, u))
-        vv = max(0.0, min(1.0, v))
+        uu = np.clip(u, 0.0, 1.0)
+        vv = np.clip(v, 0.0, 1.0)
         x = min(w - 1, max(0, int(uu * (w - 1))))
         y = min(h - 1, max(0, int(vv * (h - 1))))
         px = tex[y, x]
@@ -3038,65 +3038,90 @@ class Renderer3D:
             miny = max(0, int(min(y0, y1, y2)))
             maxy = min(h - 1, int(max(y0, y1, y2)) + 1)
 
-            w0 = 1.0 / depths[0] if depths[0] != 0 else 0.0
-            w1 = 1.0 / depths[1] if depths[1] != 0 else 0.0
-            w2 = 1.0 / depths[2] if depths[2] != 0 else 0.0
+            if maxx < minx or maxy < miny:
+                continue
 
-            for y in range(miny, maxy + 1):
-                py = y + 0.5
-                for x in range(minx, maxx + 1):
-                    px = x + 0.5
-                    bc = self.mac_barycentric((px, py), (x0, y0), (x1, y1), (x2, y2))
-                    if bc is None:
-                        continue
-                    a, b, c = bc
-                    if a < 0 or b < 0 or c < 0:
-                        continue
-                    d = a * depths[0] + b * depths[1] + c * depths[2]
-                    if d >= depth[y, x]:
-                        continue
+            inv_d0 = 1.0 / depths[0] if depths[0] != 0 else 0.0
+            inv_d1 = 1.0 / depths[1] if depths[1] != 0 else 0.0
+            inv_d2 = 1.0 / depths[2] if depths[2] != 0 else 0.0
 
-                    depth[y, x] = d
+            # Vectorize barycentrics
+            yy, xx = np.mgrid[miny:maxy+1, minx:maxx+1]
+            px = xx.astype(np.float32) + 0.5
+            py = yy.astype(np.float32) + 0.5
 
-                    if self.depth_view_enabled:
-                        cc = -pow(2, (-abs(d) * 0.75)) + 1
-                        color[y, x, :3] = (cc, cc, cc)
-                        color[y, x, 3] = 1.0
-                        continue
-                    if self.heat_map_enabled:
-                        t = max(0.0, min(1.0, d * 0.35))
-                        color[y, x, :3] = (1.0 * t, 0.0, 1.0 - t)
-                        color[y, x, 3] = 1.0
-                        continue
+            v0x, v0y = x1 - x0, y1 - y0
+            v1x, v1y = x2 - x0, y2 - y0
+            v2x, v2y = px - x0, py - y0
+            denom = v0x * v1y - v0y * v1x
+            if abs(denom) < 1e-10:
+                continue
+            w1 = (v2x * v1y - v2y * v1x) / denom
+            w2 = (v0x * v2y - v0y * v2x) / denom
+            w0 = 1.0 - w1 - w2
 
-                    if (uv1[0] < 0.0 or uv2[0] < 0.0 or uv3[0] < 0.0):
-                        cc = -pow(2, (-abs(d) * 0.75)) + 1
-                        color[y, x, :3] = (cc, cc, cc)
-                        color[y, x, 3] = 1.0
-                        continue
+            valid = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
+            if not valid.any():
+                continue
 
-                    u_num = uv1[0] * w0 * a + uv2[0] * w1 * b + uv3[0] * w2 * c
-                    v_num = uv1[1] * w0 * a + uv2[1] * w1 * b + uv3[1] * w2 * c
-                    w_num = w0 * a + w1 * b + w2 * c
-                    if w_num == 0:
-                        continue
-                    u = u_num / w_num
-                    v = 1.0 - (v_num / w_num)
+            d = w0 * depths[0] + w1 * depths[1] + w2 * depths[2]
+            d_valid = d < depth[yy, xx]
+            final_mask = valid & d_valid
+            if not final_mask.any():
+                continue
 
-                    texel = self.mac_sample_texture(u, v, is_skybox, tri_tex_index)
-                    if texel is None:
-                        cc = -pow(2, (-abs(d) * 0.75)) + 1
-                        color[y, x, :3] = (cc, cc, cc)
-                        color[y, x, 3] = 1.0
-                        continue
+            depth[yy[final_mask], xx[final_mask]] = d[final_mask]
 
-                    alpha = texel[3]
-                    base = color[y, x, :3]
-                    rgb = texel[:3]
-                    blended = base * (1.0 - alpha) + rgb * alpha
-                    blended = blended * light_m
-                    color[y, x, :3] = blended
-                    color[y, x, 3] = 1.0
+            if self.depth_view_enabled:
+                cc = -np.power(2, (-np.abs(d[final_mask]) * 0.75)) + 1
+                color[yy[final_mask], xx[final_mask], :3] = cc[:, np.newaxis]
+                color[yy[final_mask], xx[final_mask], 3] = 1.0
+            elif self.heat_map_enabled:
+                t = np.clip(d[final_mask] * 0.35, 0.0, 1.0)
+                color[yy[final_mask], xx[final_mask], :3] = np.column_stack([1.0 * t, np.zeros_like(t), 1.0 - t])
+                color[yy[final_mask], xx[final_mask], 3] = 1.0
+            elif uv1[0] < 0.0 or uv2[0] < 0.0 or uv3[0] < 0.0:
+                cc = -np.power(2, (-np.abs(d[final_mask]) * 0.75)) + 1
+                color[yy[final_mask], xx[final_mask], :3] = cc[:, np.newaxis]
+                color[yy[final_mask], xx[final_mask], 3] = 1.0
+            else:
+                u_num = uv1[0] * inv_d0 * w0 + uv2[0] * inv_d1 * w1 + uv3[0] * inv_d2 * w2
+                v_num = uv1[1] * inv_d0 * w0 + uv2[1] * inv_d1 * w1 + uv3[1] * inv_d2 * w2
+                w_num = inv_d0 * w0 + inv_d1 * w1 + inv_d2 * w2
+                w_valid = w_num != 0
+                final_mask = final_mask & w_valid
+                if final_mask.any():
+                    u = u_num[final_mask] / w_num[final_mask]
+                    v = 1.0 - (v_num[final_mask] / w_num[final_mask])
+
+                    if is_skybox:
+                        tex = getattr(self, "_mac_skybox_texture", None)
+                    else:
+                        layers = getattr(self, "_mac_texture_layers", [])
+                        tex = None
+                        if tri_tex_index is not None and 0 <= int(tri_tex_index) < len(layers):
+                            tex = layers[int(tri_tex_index)]
+
+                    if tex is None:
+                        cc = -np.power(2, (-np.abs(d[final_mask]) * 0.75)) + 1
+                        color[yy[final_mask], xx[final_mask], :3] = cc[:, np.newaxis]
+                        color[yy[final_mask], xx[final_mask], 3] = 1.0
+                    else:
+                        th, tw = tex.shape[:2]
+                        uu = np.clip(u, 0.0, 1.0)
+                        vv = np.clip(v, 0.0, 1.0)
+                        tx = np.clip((uu * (tw - 1)).astype(np.int32), 0, tw - 1)
+                        ty = np.clip((vv * (th - 1)).astype(np.int32), 0, th - 1)
+                        texel = tex[ty, tx]
+                        if texel.dtype != np.float32:
+                            texel = texel.astype(np.float32) / 255.0
+                        alpha = texel[:, 3:4]
+                        base = color[yy[final_mask], xx[final_mask], :3]
+                        rgb = texel[:, :3]
+                        blended = base * (1.0 - alpha) + rgb * alpha
+                        blended = blended * light_m
+                        color[yy[final_mask], xx[final_mask], :3] = blended
+                        color[yy[final_mask], xx[final_mask], 3] = 1.0
 
         return color
 
