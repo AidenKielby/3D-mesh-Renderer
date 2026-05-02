@@ -15,6 +15,15 @@ else:
     from Metal import *
     from Quartz import *
 
+# Optional moderngl import on macOS for compatibility.
+if sys.platform == "darwin":
+    try:
+        import moderngl as _moderngl
+        moderngl = _moderngl
+        _MAC_HAS_MODERNGL = True
+    except Exception:
+        _MAC_HAS_MODERNGL = False
+
 from PIL import Image
 from enum import Enum
 
@@ -753,15 +762,23 @@ class Renderer3D:
 
         def set_render_mesh():
             self.raster_selected = False
-            self.set_render_type(renderer_type.MESH)
+            if sys.platform != "darwin":
+                self.set_render_type(renderer_type.MESH)
+            else:
+                self.mac_set_render_type(renderer_type.MESH)
 
         def set_render_fill():
             self.raster_selected = False
-            self.set_render_type(renderer_type.POLYGON_FILL)
+            if sys.platform != "darwin":
+                self.set_render_type(renderer_type.RASTERIZE)
+            else:
+                self.mac_set_render_type(renderer_type.RASTERIZE)
 
         def set_render_raster():
             if sys.platform != "darwin":
                 self.set_render_type(renderer_type.RASTERIZE)
+            else:
+                self.mac_set_render_type(renderer_type.RASTERIZE)
 
         def toggle_depth_setting():
             self.depth_view_enabled = not self.depth_view_enabled
@@ -956,6 +973,9 @@ class Renderer3D:
                 pass
 
             #self.shaders.append({'shader': cs, 'inputs': []})
+
+        if sys.platform == "darwin":
+            self.mac_enable_raster()
 
         self.rasterization_mult = 0.5
 
@@ -2574,13 +2594,21 @@ class Renderer3D:
             if self.show_pause_menu:
                 if self.pause_img is None and self.raster_selected:
                     self.capture_pause_snapshot()
-                    self.set_render_type(renderer_type.POLYGON_FILL)
+                    if sys.platform != "darwin":
+                        self.set_render_type(renderer_type.POLYGON_FILL)
+                    else:
+                        self.mac_set_render_type(renderer_type.POLYGON_FILL)
                 if self.pause_img is not None and self.raster_selected:
                     self.screen.blit(self.upscaled_surface, (0, 0))
             else:
                 if self.raster_selected and self.pause_img is not None:
-                    self.set_render_type(renderer_type.RASTERIZE)
+                    if sys.platform != "darwin":
+                        self.set_render_type(renderer_type.RASTERIZE)
+                    else:
+                        self.mac_set_render_type(renderer_type.RASTERIZE)
                 self.pause_img = None
+
+            #print(self.pause_img)
             
             for button in self.pause_buttons:
                 button.toggled = False
@@ -2727,8 +2755,433 @@ class Renderer3D:
 
         for i in ent_indexes:
             del self.vertices_faces_list[i]
-        
 
+    def mac_barycentric(self, p, a, b, c):
+        v0 = (b[0] - a[0], b[1] - a[1])
+        v1 = (c[0] - a[0], c[1] - a[1])
+        v2 = (p[0] - a[0], p[1] - a[1])
+        denom = v0[0] * v1[1] - v0[1] * v1[0]
+        if abs(denom) < 1e-10:
+            return None
+        w1 = (v2[0] * v1[1] - v2[1] * v1[0]) / denom
+        w2 = (v0[0] * v2[1] - v0[1] * v2[0]) / denom
+        w0 = 1.0 - w1 - w2
+        return (w0, w1, w2)
+
+    def mac_sample_texture(self, u, v, is_skybox, texture_index):
+        if is_skybox:
+            tex = getattr(self, "_mac_skybox_texture", None)
+        else:
+            layers = getattr(self, "_mac_texture_layers", [])
+            if texture_index is None or texture_index < 0 or texture_index >= len(layers):
+                tex = None
+            else:
+                tex = layers[int(texture_index)]
+        if tex is None:
+            return None
+
+        h, w = tex.shape[:2]
+        uu = np.clip(u, 0.0, 1.0)
+        vv = np.clip(v, 0.0, 1.0)
+        x = min(w - 1, max(0, int(uu * (w - 1))))
+        y = min(h - 1, max(0, int(vv * (h - 1))))
+        px = tex[y, x]
+        if px.dtype != np.float32:
+            return px.astype(np.float32) / 255.0
+        return px
+
+    def mac_set_rasterization_size(self, size: tuple[int, int]):
+        width, height = size
+        width = width + (16 - width % 16) % 16
+        height = height + (16 - height % 16) % 16
+        self.rasterization_size = (width, height)
+        self.raster_half_w = self.rasterization_size[0] // 2
+        self.raster_half_h = self.rasterization_size[1] // 2
+        self._mac_output = np.ones((height, width, 4), dtype=np.float32)
+        self._mac_depth = np.full((height, width), np.inf, dtype=np.float32)
+        self._output_clear_rgba = np.ones((height, width, 4), dtype=np.float32)
+
+    def mac_toggle_depth_view(self, b: bool):
+        self.depth_view_enabled = b
+
+    def mac_toggle_heat_map(self, b: bool):
+        self.heat_map_enabled = b
+
+    def mac_set_texture_for_raster(self, img_path):
+        if img_path is None:
+            return None
+        img = Image.open(img_path).convert("RGBA")
+        img_data = np.array(img, dtype='u1')
+        self._mac_texture_layers = [img_data]
+        self._mac_textures = {img_path: 0}
+        self.texture_layers = self._mac_texture_layers
+        self.textures = self._mac_textures
+        return 0
+
+    def mac_add_texture_for_raster(self, img_path):
+        if img_path is None:
+            return None
+        if not getattr(self, "_mac_texture_layers", []):
+            return self.mac_set_texture_for_raster(img_path)
+        if img_path in self._mac_textures:
+            return self._mac_textures[img_path]
+
+        img = Image.open(img_path).convert("RGBA")
+        img_data = np.array(img, dtype='u1')
+
+        base_h, base_w, _ = self._mac_texture_layers[0].shape
+        h, w, _ = img_data.shape
+        if (h, w) != (base_h, base_w):
+            img = img.resize((base_w, base_h), Image.Resampling.NEAREST)
+            img_data = np.array(img, dtype='u1')
+
+        self._mac_texture_layers.append(img_data)
+        idx = len(self._mac_texture_layers) - 1
+        self._mac_textures[img_path] = idx
+        self.texture_layers = self._mac_texture_layers
+        self.textures = self._mac_textures
+        return idx
+
+    def mac_rebuild_textures(self):
+        # CPU textures are stored in-memory; nothing to rebuild.
+        return
+
+    def mac_generate_cubemap_skybox(self, radius: int, texture_path, left_uvs, right_uvs, top_uvs, bottom_uvs, forward_uvs, backward_uvs):
+        self.render_distance = radius
+        verts = np.array([(-1,-1,-1), (1,-1,-1), (-1,1,-1), (-1,-1,1), (1,1,-1), (-1,1,1), (1,-1,1), (1,1,1)])
+        verts = verts * radius
+        faces = [(0,3,2), (2,5,3), (1,4,6), (6,4,7), (0,1,2), (2,1,4), (3,5,6), (6,5,7), (0,6,1), (0,3,6), (2,4,5), (5,4,7)]
+
+        uvs = [
+            left_uvs[1], left_uvs[3], left_uvs[0], left_uvs[2],
+            right_uvs[0], right_uvs[1], right_uvs[2], right_uvs[3],
+            backward_uvs[0], backward_uvs[1], backward_uvs[2], backward_uvs[3],
+            forward_uvs[0], forward_uvs[1], forward_uvs[2], forward_uvs[3],
+            bottom_uvs[0], bottom_uvs[1], bottom_uvs[2], bottom_uvs[3],
+            top_uvs[0], top_uvs[1], top_uvs[2], top_uvs[3],
+        ]
+
+        uv_faces = [
+            (0, 2, 1), (1, 3, 2),
+            (4, 6, 5), (5, 6, 7),
+            (9, 8, 11), (11, 8, 10),
+            (12, 14, 13), (13, 14, 15),
+            (16, 19, 17), (16, 18, 19),
+            (22, 23, 20), (20, 23, 21),
+        ]
+
+        self.skybox_texture_path = texture_path
+        img = Image.open(self.skybox_texture_path).convert("RGBA")
+        self._mac_skybox_texture = np.array(img, dtype='u1')
+        self.vertices_faces_list.append([verts.tolist(), faces, uvs, uv_faces, object_type.SKYBOX, 0])
+
+    def mac_generate_cross_type_cubemap_skybox(self, radius: int, img_path):
+        img_w, img_h = Image.open(img_path).size
+        eps_x = 1.0 / img_w
+        eps_y = 1.0 / img_h
+        self.mac_generate_cubemap_skybox(radius, img_path,
+            ((0.75-eps_x,   1/3+eps_y), (0.5+eps_x,     1/3+eps_y), (0.75-eps_x,   2/3-eps_y), (0.5+eps_x,     2/3-eps_y)),
+            ((0.25-eps_x,   1/3+eps_y), (0+eps_x,       1/3+eps_y), (0.25-eps_x,   2/3-eps_y), (0+eps_x,       2/3-eps_y)),
+            ((0.5-eps_x,    1-eps_y),   (0.25+eps_x,    1-eps_y),   (0.5-eps_x,    2/3+eps_y), (0.25+eps_x,    2/3+eps_y)),
+            ((0.5-eps_x,     1/3-eps_y), (0.25+eps_x,   1/3-eps_y), (0.5-eps_x,     0+eps_y),   (0.25+eps_x,   0+eps_y)),
+            ((0.75+eps_x,    1/3+eps_y), (1-eps_x,      1/3+eps_y), (0.75+eps_x,    2/3-eps_y), (1-eps_x,      2/3-eps_y)),
+            ((0.25+eps_x,    1/3+eps_y), (0.5-eps_x,    1/3+eps_y), (0.25+eps_x,    2/3-eps_y), (0.5-eps_x,    2/3-eps_y)),
+        )
+
+    def mac_capture_pause_snapshot(self):
+        if self._mac_last_surface is None:
+            return
+        if self.upscaled_surface.get_size() != (self.width, self.height):
+            self.upscaled_surface = pygame.Surface((self.width, self.height)).convert()
+        pygame.transform.scale(self._mac_last_surface, (self.width, self.height), self.upscaled_surface)
+        self.pause_img = self._mac_last_surface
+
+    def mac_collect_tris(self, matrix):
+        cy, sy = math.cos(self.camera.rotation[1]), math.sin(self.camera.rotation[1])
+        cx, sx = math.cos(self.camera.rotation[0]), math.sin(self.camera.rotation[0])
+        cz, sz = math.cos(self.camera.rotation[2]), math.sin(self.camera.rotation[2])
+
+        cam_right = ( cy*cz - sy*sx*sz,  -cx*sz,  sy*cz + cy*sx*sz)
+        cam_up    = ( cy*sz + sy*sx*cz,   cx*cz,  sy*sz - cy*sx*cz)
+
+        all_tris = []
+        fov_rad = math.radians(self.camera.fov)
+
+        for matI in range(len(matrix)):
+            mat = matrix[matI]
+            if mat is None:
+                continue
+
+            vertices, faces, uv, uv_faces, obj_type, material = mat
+
+            is_skybox = obj_type == object_type.SKYBOX
+            if not is_skybox:
+                texture_index = material.texture_index if hasattr(material, "texture_index") else material
+            else:
+                texture_index = material
+            is_billboard = obj_type == object_type.BILLBOARD
+
+            if is_billboard:
+                size = self.vertices_faces_list[matI][6]
+                cx_pos = self.vertices_faces_list[matI][0][0]
+
+                hs = size * 0.5
+                tr = (cx_pos[0] + cam_right[0]*hs + cam_up[0]*hs,
+                    cx_pos[1] + cam_right[1]*hs + cam_up[1]*hs,
+                    cx_pos[2] + cam_right[2]*hs + cam_up[2]*hs)
+                br = (cx_pos[0] + cam_right[0]*hs - cam_up[0]*hs,
+                    cx_pos[1] + cam_right[1]*hs - cam_up[1]*hs,
+                    cx_pos[2] + cam_right[2]*hs - cam_up[2]*hs)
+                tl = (cx_pos[0] - cam_right[0]*hs + cam_up[0]*hs,
+                    cx_pos[1] - cam_right[1]*hs + cam_up[1]*hs,
+                    cx_pos[2] - cam_right[2]*hs + cam_up[2]*hs)
+                bl = (cx_pos[0] - cam_right[0]*hs - cam_up[0]*hs,
+                    cx_pos[1] - cam_right[1]*hs - cam_up[1]*hs,
+                    cx_pos[2] - cam_right[2]*hs - cam_up[2]*hs)
+
+                def proj_pt(p):
+                    c = self.cam(p, False)
+                    if c[2] <= 0.001:
+                        return None
+                    f = 1.0 / math.tan(fov_rad / 2)
+                    return (
+                        (c[0] * f / -c[2]) * self.raster_half_h + self.raster_half_w,
+                        (c[1] * f / -c[2]) * self.raster_half_h + self.raster_half_h,
+                        c[2]
+                    )
+
+                pp = [proj_pt(v) for v in [tr, br, tl, bl]]
+                if None in pp:
+                    continue
+                bill_uvs = [(1,1), (1,0), (0,1), (0,0)]
+                bill_tris = [(0, 2, 1), (3, 1, 2)]
+                bill_uv_faces = [(0, 2, 1), (3, 1, 2)]
+
+                for fi, (f0, f1, f2) in enumerate(bill_tris):
+                    p0, p1, p2 = pp[f0], pp[f1], pp[f2]
+                    uvi = bill_uv_faces[fi]
+                    u0, u1, u2 = bill_uvs[uvi[0]], bill_uvs[uvi[1]], bill_uvs[uvi[2]]
+                    all_tris.append(((p0[2], p1[2], p2[2]), (p0, p1, p2), u0, u1, u2, 1.0, False, texture_index))
+                continue
+
+            if self.using_obj_filetype_format and not is_billboard:
+                unprojected_verticies, *_ = self.vertices_faces_list[matI]
+
+            for faceI in range(len(faces)):
+                face = faces[faceI]
+
+                if self.using_obj_filetype_format and not is_billboard:
+                    up0 = unprojected_verticies[face[0]]
+                    up1 = unprojected_verticies[face[1]]
+                    up2 = unprojected_verticies[face[2]]
+                    if None in (up0, up1, up2):
+                        continue
+
+                uv_face = uv_faces[faceI]
+                uv0 = uv[uv_face[0]]
+                uv1 = uv[uv_face[1]]
+                uv2 = uv[uv_face[2]]
+
+                if self.using_obj_filetype_format:
+                    unprojected_normal = self.normalT_camera_space((up0, up1, up2))
+                    light_dir = np.array([0, 1, 0])
+                    light_m = max(self.lighting_strictness, np.dot(light_dir, np.array(unprojected_normal)))
+
+                    cam0, cam1, cam2 = self.cam(up0, is_skybox), self.cam(up1, is_skybox), self.cam(up2, is_skybox)
+
+                    clipped = self.clip_triangle_near([cam0, cam1, cam2], [uv0, uv1, uv2], near=0.001)
+
+                    for clipped_verts, clipped_uvs in clipped:
+                        def proj(v):
+                            f = 1.0 / math.tan(fov_rad / 2)
+                            return (
+                                (v[0] * f / -v[2]) * self.raster_half_h + self.raster_half_w,
+                                (v[1] * f / -v[2]) * self.raster_half_h + self.raster_half_h,
+                                v[2]
+                            )
+                        pp0, pp1, pp2 = proj(clipped_verts[0]), proj(clipped_verts[1]), proj(clipped_verts[2])
+                        if not is_skybox:
+                            if self.is_backface_projected(pp0, pp1, pp2):
+                                continue
+                        if is_skybox:
+                            all_tris.append(((pp0[2], pp1[2], pp2[2]), (pp0, pp1, pp2), clipped_uvs[0], clipped_uvs[1], clipped_uvs[2], light_m, is_skybox, texture_index))
+                        else:
+                            if not (abs(pp0[2]) > self.render_distance and abs(pp1[2]) > self.render_distance and abs(pp2[2]) > self.render_distance):
+                                all_tris.append(((pp0[2], pp1[2], pp2[2]), (pp0, pp1, pp2), clipped_uvs[0], clipped_uvs[1], clipped_uvs[2], light_m, is_skybox, texture_index))
+                else:
+                    p0 = vertices[face[0]]
+                    p1 = vertices[face[1]]
+                    p2 = vertices[face[2]]
+                    if None in (p0, p1, p2):
+                        continue
+                    if not (p0[2] < 0 or p1[2] < 0 or p2[2] < 0):
+                        all_tris.append(((p0[2], p1[2], p2[2]), (p0, p1, p2), uv0, uv1, uv2, 1.0, is_skybox, texture_index))
+
+        return all_tris
+
+    def mac_rasterize_tris(self, all_tris):
+        h, w = self.rasterization_size[1], self.rasterization_size[0]
+        color = self._mac_output
+        depth = self._mac_depth
+
+        color[:] = 1.0
+        depth[:] = np.inf
+
+        for depths, tri, uv1, uv2, uv3, light_m, is_skybox, tri_tex_index in all_tris:
+            p0, p1, p2 = tri
+            x0, y0 = p0[0], p0[1]
+            x1, y1 = p1[0], p1[1]
+            x2, y2 = p2[0], p2[1]
+
+            minx = max(0, int(min(x0, x1, x2)))
+            maxx = min(w - 1, int(max(x0, x1, x2)) + 1)
+            miny = max(0, int(min(y0, y1, y2)))
+            maxy = min(h - 1, int(max(y0, y1, y2)) + 1)
+
+            if maxx < minx or maxy < miny:
+                continue
+
+            inv_d0 = 1.0 / depths[0] if depths[0] != 0 else 0.0
+            inv_d1 = 1.0 / depths[1] if depths[1] != 0 else 0.0
+            inv_d2 = 1.0 / depths[2] if depths[2] != 0 else 0.0
+
+            # Vectorize barycentrics
+            yy, xx = np.mgrid[miny:maxy+1, minx:maxx+1]
+            px = xx.astype(np.float32) + 0.5
+            py = yy.astype(np.float32) + 0.5
+
+            v0x, v0y = x1 - x0, y1 - y0
+            v1x, v1y = x2 - x0, y2 - y0
+            v2x, v2y = px - x0, py - y0
+            denom = v0x * v1y - v0y * v1x
+            if abs(denom) < 1e-10:
+                continue
+            w1 = (v2x * v1y - v2y * v1x) / denom
+            w2 = (v0x * v2y - v0y * v2x) / denom
+            w0 = 1.0 - w1 - w2
+
+            valid = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
+            if not valid.any():
+                continue
+
+            d = w0 * depths[0] + w1 * depths[1] + w2 * depths[2]
+            d_valid = d < depth[yy, xx]
+            final_mask = valid & d_valid
+            if not final_mask.any():
+                continue
+
+            depth[yy[final_mask], xx[final_mask]] = d[final_mask]
+
+            if self.depth_view_enabled:
+                cc = -np.power(2, (-np.abs(d[final_mask]) * 0.75)) + 1
+                color[yy[final_mask], xx[final_mask], :3] = cc[:, np.newaxis]
+                color[yy[final_mask], xx[final_mask], 3] = 1.0
+            elif self.heat_map_enabled:
+                t = np.clip(d[final_mask] * 0.35, 0.0, 1.0)
+                color[yy[final_mask], xx[final_mask], :3] = np.column_stack([1.0 * t, np.zeros_like(t), 1.0 - t])
+                color[yy[final_mask], xx[final_mask], 3] = 1.0
+            elif uv1[0] < 0.0 or uv2[0] < 0.0 or uv3[0] < 0.0:
+                cc = -np.power(2, (-np.abs(d[final_mask]) * 0.75)) + 1
+                color[yy[final_mask], xx[final_mask], :3] = cc[:, np.newaxis]
+                color[yy[final_mask], xx[final_mask], 3] = 1.0
+            else:
+                u_num = uv1[0] * inv_d0 * w0 + uv2[0] * inv_d1 * w1 + uv3[0] * inv_d2 * w2
+                v_num = uv1[1] * inv_d0 * w0 + uv2[1] * inv_d1 * w1 + uv3[1] * inv_d2 * w2
+                w_num = inv_d0 * w0 + inv_d1 * w1 + inv_d2 * w2
+                w_valid = w_num != 0
+                final_mask = final_mask & w_valid
+                if final_mask.any():
+                    u = u_num[final_mask] / w_num[final_mask]
+                    v = 1.0 - (v_num[final_mask] / w_num[final_mask])
+
+                    if is_skybox:
+                        tex = getattr(self, "_mac_skybox_texture", None)
+                    else:
+                        layers = getattr(self, "_mac_texture_layers", [])
+                        tex = None
+                        if tri_tex_index is not None and 0 <= int(tri_tex_index) < len(layers):
+                            tex = layers[int(tri_tex_index)]
+
+                    if tex is None:
+                        cc = -np.power(2, (-np.abs(d[final_mask]) * 0.75)) + 1
+                        color[yy[final_mask], xx[final_mask], :3] = cc[:, np.newaxis]
+                        color[yy[final_mask], xx[final_mask], 3] = 1.0
+                    else:
+                        th, tw = tex.shape[:2]
+                        uu = np.clip(u, 0.0, 1.0)
+                        vv = np.clip(v, 0.0, 1.0)
+                        tx = np.clip((uu * (tw - 1)).astype(np.int32), 0, tw - 1)
+                        ty = np.clip((vv * (th - 1)).astype(np.int32), 0, th - 1)
+                        texel = tex[ty, tx]
+                        if texel.dtype != np.float32:
+                            texel = texel.astype(np.float32) / 255.0
+                        alpha = texel[:, 3:4]
+                        base = color[yy[final_mask], xx[final_mask], :3]
+                        rgb = texel[:, :3]
+                        blended = base * (1.0 - alpha) + rgb * alpha
+                        blended = blended * light_m
+                        color[yy[final_mask], xx[final_mask], :3] = blended
+                        color[yy[final_mask], xx[final_mask], 3] = 1.0
+
+        return color
+
+    def mac_render_shape_from_obj_format(self, matrix, texture_p):
+        if self.render_type != renderer_type.RASTERIZE:
+            return ORIG_RENDER_SHAPE_FROM_OBJ_FORMAT(self, matrix, texture_p)
+
+        all_tris = self.mac_collect_tris(matrix)
+        if not all_tris:
+            return
+
+        color = self.mac_rasterize_tris(all_tris)
+        img_uint8 = (np.clip(color, 0.0, 1.0) * 255).astype('uint8')
+        surface = pygame.image.frombuffer(img_uint8.tobytes(), (self.rasterization_size[0], self.rasterization_size[1]), 'RGBA')
+        if self.upscaled_surface.get_size() != (self.width, self.height):
+            self.upscaled_surface = pygame.Surface((self.width, self.height)).convert()
+        pygame.transform.scale(surface, (self.width, self.height), self.upscaled_surface)
+        self.screen.blit(self.upscaled_surface, (0, 0))
+        self._mac_last_surface = surface
+
+    def mac_set_render_type(self, type: renderer_type):
+        self.render_type = type
+        if type == renderer_type.RASTERIZE:
+            self.raster_selected = True
+            if self.resizable_window:
+                self.screen = pygame.display.set_mode((self.width, self.height), pygame.RESIZABLE)
+            else:
+                self.screen = pygame.display.set_mode((self.width, self.height))
+            self.set_rasterization_size((int(self.width * self.rasterization_mult), int(self.height * self.rasterization_mult)))
+        else:
+            self.screen = pygame.display.set_mode((self.width, self.height))
+
+    def mac_enable_raster(self):
+        if getattr(self, "_mac_raster_enabled", False):
+            return
+
+        self._mac_raster_enabled = True
+        self._mac_texture_layers = []
+        self._mac_textures = {}
+        self._mac_skybox_texture = None
+        self._mac_output = None
+        self._mac_depth = None
+        self._mac_last_surface = None
+
+        self.set_render_type = self.mac_set_render_type
+        self.set_rasterization_size = self.mac_set_rasterization_size
+        self.set_texture_for_raster = self.mac_set_texture_for_raster
+        self.add_texture_for_raster = self.mac_add_texture_for_raster
+        self.rebuild_textures = self.mac_rebuild_textures
+        self.generate_cubemap_skybox = self.mac_generate_cubemap_skybox
+        self.generate_cross_type_cubemap_skybox = self.mac_generate_cross_type_cubemap_skybox
+        self.toggle_depth_view = self.mac_toggle_depth_view
+        self.toggle_heat_map = self.mac_toggle_heat_map
+        self.capture_pause_snapshot = self.mac_capture_pause_snapshot
+        self.render_shape_from_obj_format = self.mac_render_shape_from_obj_format
+
+        if hasattr(self, "raster_button"):
+            self.raster_button.function = lambda: self.set_render_type(renderer_type.RASTERIZE)
+
+ORIG_RENDER_SHAPE_FROM_OBJ_FORMAT = Renderer3D.render_shape_from_obj_format
 
 def main():
     renderer = Renderer3D()
