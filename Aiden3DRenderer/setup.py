@@ -17,7 +17,7 @@ mac_requires = [
 
 setup(
     name="aiden3drenderer",
-    version="1.13.3",
+    version="1.13.1",
     author="Aiden",
     author_email="headstone.yt@gmail.com",
     description="A real-time 3D function visualizer with a plug-and-play GPU pipeline—write simple compute shaders to create custom effects without dealing with complex rendering internals.",
@@ -29,7 +29,7 @@ setup(
         "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Developers",
         "Topic :: Multimedia :: Graphics :: 3D Rendering",
-        "License :: OSI Approved :: APACHE 2.0 License",
+        "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
