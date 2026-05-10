@@ -141,7 +141,8 @@ def demo():
         ],
     })
 
-    renderer.run()
+    while True:
+        renderer.loopable_run()
 
 def demo_mac():
     renderer = Renderer3D(600, 600, "Skull following you and yeah", True)

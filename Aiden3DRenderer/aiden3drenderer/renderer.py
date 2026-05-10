@@ -8,23 +8,7 @@ import sys
 import importlib
 from importlib import resources
 import numpy as np
-if sys.platform != "darwin":
-    import moderngl
-else:
-    import objc
-    from Metal import *
-    from Quartz import *
 
-# Optional moderngl import on macOS for compatibility.
-if sys.platform == "darwin":
-    try:
-        import moderngl as _moderngl
-        moderngl = _moderngl
-        _MAC_HAS_MODERNGL = True
-    except Exception:
-        _MAC_HAS_MODERNGL = False
-
-from PIL import Image
 from enum import Enum
 
 from .material import Material
@@ -63,520 +47,6 @@ class renderer_type(Enum):
     POLYGON_FILL = "polygon_fill"
     MESH = "mesh"
 
-glsl_frag_shader = """
-#version 330
-
-uniform sampler2D tex;
-
-in vec2 uv;
-out vec4 fragColor;
-
-void main() {
-    fragColor = texture(tex, vec2(uv.x, 1-uv.y));
-}
-"""
-
-glsl_vert_shader = """
-#version 330
-
-in vec2 in_pos;
-out vec2 uv;
-
-void main() {
-    uv = (in_pos + 1.0) * 0.5;
-    gl_Position = vec4(in_pos, 0.0, 1.0);
-}
-"""
-
-compute_shader_for_rasterization = """
-#version 430
-
-layout(local_size_x = 16, local_size_y = 16) in;
-
-struct Triangle {
-    vec2 pos1;    // 0  - 8  bytes
-    vec2 pos2;    // 8  - 16 bytes 
-    vec2 pos3;    // 16 - 24 bytes 
-    
-    float d1;     // 24 - 28 bytes (Depth for p1)
-    float d2;     // 28 - 32 bytes (Depth for p2)
-    float d3;     // 32 - 36 bytes (Depth for p3)
-    
-    float light_mult;   // 36 - 40 
-
-    vec2 uv1;    // 40 - 48
-    vec2 uv2;    // 48 - 56
-    vec2 uv3;    // 56 - 64
-
-    float is_skybox;   // 64 - 68
-    float texture_index; // 68 - 72
-    float pad1; // 72 - 76
-    float pad2; // 76 - 80
-};
-
-layout(std430, binding = 0) buffer triangle_data {
-    Triangle tris[];
-};
-
-layout(rgba32f, binding = 0) uniform image2D destTex;
-
-layout(binding = 1) uniform sampler2DArray inTex;
-layout(binding = 2) uniform sampler2D skyTex;
-uniform uint tri_count;
-
-uniform bool depthView;
-uniform bool heatMap;
-
-shared Triangle local_tris[256];
-
-float dot(vec2 p1, vec2 p3, vec2 p2) {
-    vec2 tri_vec = p2-p1;
-    vec2 other_vec = p3 - p1;
-
-    return tri_vec.x * other_vec.y - tri_vec.y * other_vec.x;
-}   
-
-bool is_point_in_tri(vec2 p0, vec2 p1, vec2 p2, vec2 point) {
-    float d1 = dot(p0, p1, point);
-    float d2 = dot(p1, p2, point);
-    float d3 = dot(p2, p0, point);
-
-    bool has_neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
-    bool has_pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
-    
-    return !(has_neg && has_pos);
-}  
-
-float tri_area(vec2 p1, vec2 p2, vec2 p3){
-    vec2 a = p2 - p1;
-    vec2 b = p3 - p1;
-    // The magnitude of the cross product of two vectors 
-    // is the area of the parallelogram they form. 
-    // Half of that is the triangle area.
-    return 0.5 * abs(a.x * b.y - a.y * b.x);
-}
-
-float cross2d(vec2 a, vec2 b) {
-    return a.x * b.y - a.y * b.x;
-}
-
-float depth_in_tri(vec2 p0, vec2 p1, vec2 p2, vec2 point, vec3 depths) {
-    vec2 v0 = p1 - p0;
-    vec2 v1 = p2 - p0;
-    vec2 v2 = point - p0;
-
-    // Total area (technically double the area, but ratios remain the same)
-    float total = cross2d(v0, v1);
-
-    // Prevent division by zero for degenerate triangles
-    if (abs(total) < 0.00001) {
-        return 1e38; // GLSL equivalent of infinity
-    }
-
-    // Barycentric coordinates (weights)
-    // We use the vectors from the vertices to the point
-    float w1 = cross2d(v2, v1) / total;
-    float w2 = cross2d(v0, v2) / total;
-    float w0 = 1.0 - w1 - w2;
-
-    // Interpolate depth using the weights
-    // depths.x = depth at p0, depths.y = depth at p1, depths.z = depth at p2
-    float depth = w0 * depths.x + w1 * depths.y + w2 * depths.z;
-
-    return depth;
-}
-
-void main() {
-    ivec2 pixel_coords = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 dims = imageSize(destTex);
-    bool in_b = pixel_coords.x < dims.x && pixel_coords.y < dims.y;
-
-    vec2 p_center = vec2(pixel_coords) + 0.5;
-
-    float best_depth = 1e38;
-    vec3 best_color = imageLoad(destTex, pixel_coords).rgb;
-
-    uint num_tris = min(tri_count, uint(tris.length()));
-    uint local_id = gl_LocalInvocationIndex; // 0 to 255
-
-    // LOOP IN CHUNKS OF 256
-    for (uint i = 0; i < num_tris; i += 256) {
-        if (i + local_id < num_tris) {
-            local_tris[local_id] = tris[i + local_id];
-        }
-        
-        barrier(); // Wait for all threads to finish loading
-        uint limit = min(256, num_tris - i);
-        if (in_b) {
-            for (uint j = 0; j < limit; j++) {
-                float minx = min(min(local_tris[j].pos1.x, local_tris[j].pos2.x), local_tris[j].pos3.x);
-                float maxx = max(max(local_tris[j].pos1.x, local_tris[j].pos2.x), local_tris[j].pos3.x);
-                float miny = min(min(local_tris[j].pos1.y, local_tris[j].pos2.y), local_tris[j].pos3.y);
-                float maxy = max(max(local_tris[j].pos1.y, local_tris[j].pos2.y), local_tris[j].pos3.y);
-                if (p_center.x < minx || p_center.x > maxx ||
-                    p_center.y < miny || p_center.y > maxy) {
-                    continue;
-                }
-                if (is_point_in_tri(local_tris[j].pos1, local_tris[j].pos2, local_tris[j].pos3, p_center)) {
-                    vec3 ds = vec3(local_tris[j].d1, local_tris[j].d2, local_tris[j].d3);
-                    float d = depth_in_tri(local_tris[j].pos1, local_tris[j].pos2, local_tris[j].pos3, p_center, ds);
-                    
-                    if (d < best_depth) {
-                        best_depth = d;
-                        if (depthView){
-                            float c = -pow(2, (-abs(d) * 0.75))+1;
-                            best_color = vec3(c, c, c);
-                        }
-                        else if (heatMap){
-                            float t = clamp(d * 0.35, 0.0, 1.0);
-                            best_color = mix(vec3(0.0, 0.0, 1.0), vec3(1.0, 0.0, 0.0), t);
-                        }
-                        else{
-                            if (local_tris[j].uv1.x < 0.0 || local_tris[j].uv2.x < 0.0 || local_tris[j].uv3.x < 0.0) {
-                                float c = -pow(2, (-abs(d) * 0.75))+1;
-                                best_color = vec3(c, c, c);
-                            }
-                            else{
-                                vec3 ws = vec3(1.0/local_tris[j].d1, 1.0/local_tris[j].d2, 1.0/local_tris[j].d3);
-
-                                vec3 us = vec3(local_tris[j].uv1.x * ws.x, local_tris[j].uv2.x * ws.y, local_tris[j].uv3.x * ws.z);
-                                vec3 vs = vec3(local_tris[j].uv1.y * ws.x, local_tris[j].uv2.y * ws.y, local_tris[j].uv3.y * ws.z);
-
-                                float u_over_w = depth_in_tri(local_tris[j].pos1, local_tris[j].pos2, local_tris[j].pos3, p_center, us);
-                                float v_over_w = depth_in_tri(local_tris[j].pos1, local_tris[j].pos2, local_tris[j].pos3, p_center, vs);
-                                float one_over_w = depth_in_tri(local_tris[j].pos1, local_tris[j].pos2, local_tris[j].pos3, p_center, ws);
-
-                                vec2 uv = vec2(u_over_w / one_over_w, 1.0 - (v_over_w / one_over_w));
-
-                                vec4 color = vec4(1.0);
-                                vec3 real_col = vec3(1.0);
-
-                                if (local_tris[j].is_skybox == 1){
-                                    color = texture(skyTex, uv);
-                                    real_col = vec3(color.x, color.y, color.z);
-                                    real_col = best_color * (1-color.w) + real_col * color.w;
-                                }
-                                else{
-                                    color = texture(inTex, vec3(uv, local_tris[j].texture_index));
-                                    real_col = vec3(color.x, color.y, color.z);
-                                    real_col = best_color * (1-color.w) + real_col * color.w;
-                                }
-
-                                best_color = vec3(real_col.x * local_tris[j].light_mult, real_col.y * local_tris[j].light_mult, real_col.z * local_tris[j].light_mult);
-                            }
-                            
-                        }
-                    }
-                }
-            }
-        }
-        
-        barrier(); // Wait before loading the next chunk
-    }
-
-    if (in_b){
-        imageStore(destTex, pixel_coords, vec4(best_color, 1.0));
-    }
-
-}
-
-"""
-
-metal_compute_shader = """
-#pragma clang diagnostic ignored "-Wmissing-prototypes"
-
-#include <metal_stdlib>
-#include <simd/simd.h>
-
-using namespace metal;
-
-struct Globals
-{
-    uint tri_count;
-    uint depthView;
-    uint heatMap;
-};
-
-struct Triangle
-{
-    float2 pos1;
-    float2 pos2;
-    float2 pos3;
-    float d1;
-    float d2;
-    float d3;
-    float light_mult;
-    float2 uv1;
-    float2 uv2;
-    float2 uv3;
-    float is_skybox;
-    float texture_index;
-    float pad1;
-    float pad2;
-};
-
-struct triangle_data
-{
-    Triangle tris[1];
-};
-
-
-constant uint3 gl_WorkGroupSize [[maybe_unused]] = uint3(16u, 16u, 1u);
-
-static inline __attribute__((always_inline))
-float _dot(thread const float2& p1, thread const float2& p3, thread const float2& p2)
-{
-    float2 tri_vec = p2 - p1;
-    float2 other_vec = p3 - p1;
-    return (tri_vec.x * other_vec.y) - (tri_vec.y * other_vec.x);
-}
-
-static inline __attribute__((always_inline))
-bool is_point_in_tri(thread const float2& p0, thread const float2& p1, thread const float2& p2, thread const float2& point)
-{
-    float2 param = p0;
-    float2 param_1 = p1;
-    float2 param_2 = point;
-    float d1 = _dot(param, param_1, param_2);
-    float2 param_3 = p1;
-    float2 param_4 = p2;
-    float2 param_5 = point;
-    float d2 = _dot(param_3, param_4, param_5);
-    float2 param_6 = p2;
-    float2 param_7 = p0;
-    float2 param_8 = point;
-    float d3 = _dot(param_6, param_7, param_8);
-    bool has_neg = ((d1 < 0.0) || (d2 < 0.0)) || (d3 < 0.0);
-    bool has_pos = ((d1 > 0.0) || (d2 > 0.0)) || (d3 > 0.0);
-    return !(has_neg && has_pos);
-}
-
-static inline __attribute__((always_inline))
-float cross2d(thread const float2& a, thread const float2& b)
-{
-    return (a.x * b.y) - (a.y * b.x);
-}
-
-static inline __attribute__((always_inline))
-float depth_in_tri(thread const float2& p0, thread const float2& p1, thread const float2& p2, thread const float2& point, thread const float3& depths)
-{
-    float2 v0 = p1 - p0;
-    float2 v1 = p2 - p0;
-    float2 v2 = point - p0;
-    float2 param = v0;
-    float2 param_1 = v1;
-    float total = cross2d(param, param_1);
-    if (abs(total) < 9.9999997473787516355514526367188e-06)
-    {
-        return 9.9999996802856924650656260769173e+37;
-    }
-    float2 param_2 = v2;
-    float2 param_3 = v1;
-    float w1 = cross2d(param_2, param_3) / total;
-    float2 param_4 = v0;
-    float2 param_5 = v2;
-    float w2 = cross2d(param_4, param_5) / total;
-    float w0 = (1.0 - w1) - w2;
-    float depth = ((w0 * depths.x) + (w1 * depths.y)) + (w2 * depths.z);
-    return depth;
-}
-
-kernel void main0(constant uint* spvBufferSizeConstants [[buffer(25)]], constant Globals& globals [[buffer(0)]], device triangle_data& _251 [[buffer(1)]], texture2d<float, access::read_write> destTex [[texture(0)]], texture2d<float> skyTex [[texture(1)]], texture2d_array<float> inTex [[texture(2)]], sampler skyTexSmplr [[sampler(0)]], sampler inTexSmplr [[sampler(1)]], uint3 gl_GlobalInvocationID [[thread_position_in_grid]], uint gl_LocalInvocationIndex [[thread_index_in_threadgroup]])
-{
-    threadgroup Triangle local_tris[256];
-    constant uint& _251BufferSize = spvBufferSizeConstants[1];
-    int2 pixel_coords = int2(gl_GlobalInvocationID.xy);
-    int2 dims = int2(destTex.get_width(), destTex.get_height());
-    bool _216 = pixel_coords.x < dims.x;
-    bool _224;
-    if (_216)
-    {
-        _224 = pixel_coords.y < dims.y;
-    }
-    else
-    {
-        _224 = _216;
-    }
-    bool in_b = _224;
-    float2 p_center = float2(pixel_coords) + float2(0.5);
-    float best_depth = 9.9999996802856924650656260769173e+37;
-    float3 best_color = destTex.read(uint2(pixel_coords)).xyz;
-    uint num_tris = min(globals.tri_count, uint(int((_251BufferSize - 0) / 80)));
-    uint local_id = gl_LocalInvocationIndex;
-    for (uint i = 0u; i < num_tris; i += 256u)
-    {
-        if ((i + local_id) < num_tris)
-        {
-            uint _284 = i + local_id;
-            local_tris[local_id].pos1 = _251.tris[_284].pos1;
-            local_tris[local_id].pos2 = _251.tris[_284].pos2;
-            local_tris[local_id].pos3 = _251.tris[_284].pos3;
-            local_tris[local_id].d1 = _251.tris[_284].d1;
-            local_tris[local_id].d2 = _251.tris[_284].d2;
-            local_tris[local_id].d3 = _251.tris[_284].d3;
-            local_tris[local_id].light_mult = _251.tris[_284].light_mult;
-            local_tris[local_id].uv1 = _251.tris[_284].uv1;
-            local_tris[local_id].uv2 = _251.tris[_284].uv2;
-            local_tris[local_id].uv3 = _251.tris[_284].uv3;
-            local_tris[local_id].is_skybox = _251.tris[_284].is_skybox;
-            local_tris[local_id].texture_index = _251.tris[_284].texture_index;
-            local_tris[local_id].pad1 = _251.tris[_284].pad1;
-            local_tris[local_id].pad2 = _251.tris[_284].pad2;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint limit = min(256u, (num_tris - i));
-        if (in_b)
-        {
-            for (uint j = 0u; j < limit; j++)
-            {
-                float minx = fast::min(fast::min(local_tris[j].pos1.x, local_tris[j].pos2.x), local_tris[j].pos3.x);
-                float maxx = fast::max(fast::max(local_tris[j].pos1.x, local_tris[j].pos2.x), local_tris[j].pos3.x);
-                float miny = fast::min(fast::min(local_tris[j].pos1.y, local_tris[j].pos2.y), local_tris[j].pos3.y);
-                float maxy = fast::max(fast::max(local_tris[j].pos1.y, local_tris[j].pos2.y), local_tris[j].pos3.y);
-                bool _402 = p_center.x < minx;
-                bool _410;
-                if (!_402)
-                {
-                    _410 = p_center.x > maxx;
-                }
-                else
-                {
-                    _410 = _402;
-                }
-                bool _418;
-                if (!_410)
-                {
-                    _418 = p_center.y < miny;
-                }
-                else
-                {
-                    _418 = _410;
-                }
-                bool _426;
-                if (!_418)
-                {
-                    _426 = p_center.y > maxy;
-                }
-                else
-                {
-                    _426 = _418;
-                }
-                if (_426)
-                {
-                    continue;
-                }
-                float2 param = local_tris[j].pos1;
-                float2 param_1 = local_tris[j].pos2;
-                float2 param_2 = local_tris[j].pos3;
-                float2 param_3 = p_center;
-                if (is_point_in_tri(param, param_1, param_2, param_3))
-                {
-                    float3 ds = float3(local_tris[j].d1, local_tris[j].d2, local_tris[j].d3);
-                    float2 param_4 = local_tris[j].pos1;
-                    float2 param_5 = local_tris[j].pos2;
-                    float2 param_6 = local_tris[j].pos3;
-                    float2 param_7 = p_center;
-                    float3 param_8 = ds;
-                    float d = depth_in_tri(param_4, param_5, param_6, param_7, param_8);
-                    if (d < best_depth)
-                    {
-                        best_depth = d;
-                        if (globals.depthView != 0u)
-                        {
-                            float c = (-pow(2.0, (-abs(d)) * 0.75)) + 1.0;
-                            best_color = float3(c);
-                        }
-                        else
-                        {
-                            if (globals.heatMap != 0u)
-                            {
-                                float t = fast::clamp(d * 0.3499999940395355224609375, 0.0, 1.0);
-                                best_color = mix(float3(0.0, 0.0, 1.0), float3(1.0, 0.0, 0.0), t);
-                            }
-                            else
-                            {
-                                bool _519 = (local_tris[j].uv1)[0u] < 0.0;
-                                bool _527;
-                                if (!_519)
-                                {
-                                    _527 = (local_tris[j].uv2)[0u] < 0.0;
-                                }
-                                else
-                                {
-                                    _527 = _519;
-                                }
-                                bool _535;
-                                if (!_527)
-                                {
-                                    _535 = (local_tris[j].uv3)[0u] < 0.0;
-                                }
-                                else
-                                {
-                                    _535 = _527;
-                                }
-                                if (_535)
-                                {
-                                    float c_1 = (-pow(2.0, (-abs(d)) * 0.75)) + 1.0;
-                                    best_color = float3(c_1);
-                                }
-                                else
-                                {
-                                    float3 ws = float3(1.0 / local_tris[j].d1, 1.0 / local_tris[j].d2, 1.0 / local_tris[j].d3);
-                                    float3 us = float3((local_tris[j].uv1)[0u] * ws.x, (local_tris[j].uv2)[0u] * ws.y, (local_tris[j].uv3)[0u] * ws.z);
-                                    float3 vs = float3((local_tris[j].uv1)[1u] * ws.x, (local_tris[j].uv2)[1u] * ws.y, (local_tris[j].uv3)[1u] * ws.z);
-                                    float2 param_9 = local_tris[j].pos1;
-                                    float2 param_10 = local_tris[j].pos2;
-                                    float2 param_11 = local_tris[j].pos3;
-                                    float2 param_12 = p_center;
-                                    float3 param_13 = us;
-                                    float u_over_w = depth_in_tri(param_9, param_10, param_11, param_12, param_13);
-                                    float2 param_14 = local_tris[j].pos1;
-                                    float2 param_15 = local_tris[j].pos2;
-                                    float2 param_16 = local_tris[j].pos3;
-                                    float2 param_17 = p_center;
-                                    float3 param_18 = vs;
-                                    float v_over_w = depth_in_tri(param_14, param_15, param_16, param_17, param_18);
-                                    float2 param_19 = local_tris[j].pos1;
-                                    float2 param_20 = local_tris[j].pos2;
-                                    float2 param_21 = local_tris[j].pos3;
-                                    float2 param_22 = p_center;
-                                    float3 param_23 = ws;
-                                    float one_over_w = depth_in_tri(param_19, param_20, param_21, param_22, param_23);
-                                    float2 uv = float2(u_over_w / one_over_w, 1.0 - (v_over_w / one_over_w));
-                                    float4 color = float4(1.0);
-                                    float3 real_col = float3(1.0);
-                                    if (local_tris[j].is_skybox > 0.5)
-                                    {
-                                        color = skyTex.sample(skyTexSmplr, uv, level(0.0));
-                                        real_col = float3(color.x, color.y, color.z);
-                                        real_col = (best_color * (1.0 - color.w)) + (real_col * color.w);
-                                    }
-                                    else
-                                    {
-                                        uint slice = uint(local_tris[j].texture_index);
-                                        color = inTex.sample(inTexSmplr, uv, slice);
-                                        real_col = float3(color.x, color.y, color.z);
-                                        real_col = (best_color * (1.0 - color.w)) + (real_col * color.w);
-                                    }
-                                    best_color = float3(real_col.x * local_tris[j].light_mult, real_col.y * local_tris[j].light_mult, real_col.z * local_tris[j].light_mult);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (in_b)
-    {
-        destTex.write(float4(best_color, 1.0), uint2(pixel_coords));
-    }
-}
-
-
-"""
-
 tri_dtype = np.dtype([
     ('pos', 'f4', (3, 2)),    # 3 positions (x, y)
     ('depths', 'f4', 3),      # 3 depth values
@@ -614,6 +84,20 @@ class Renderer3D:
         self.is_starting = True
         self.resizable_window = resizable_window
 
+        self.textures = {}
+        self.last_texture_array = None
+        self.last_size = 1
+        self.texture_layers = []
+
+        if sys.platform == "darwin":
+            from .metal_backend import MetalBackend
+            self.backend = MetalBackend()
+        else:
+            from .moderngl_backend import ModernGLBackend
+            self.backend = ModernGLBackend()
+
+        self.backend.setup(width, height, False, self)
+
         self.render_type = renderer_type.MESH
         if self.render_type == renderer_type.RASTERIZE:
             if resizable_window:
@@ -637,7 +121,6 @@ class Renderer3D:
 
         self.grid_coords_list = []
         self.vertices_faces_list = []
-        self.textures = {} # name, index
         self.projected_vertices_faces_list = []
         self.using_obj_filetype_format = False
         self.projections_list = []
@@ -645,10 +128,6 @@ class Renderer3D:
         self.is_using_default_shapes = load_default_shapes
         self._default_shape_names = set()
         self._default_shapes_loaded = False
-
-        self.last_texture_array = None
-        self.last_size = 1
-        self.texture_layers = []
 
         self.lighting_strictness = 0.5
 
@@ -669,62 +148,6 @@ class Renderer3D:
             self._default_shape_names = after - before
             self._default_shapes_loaded = bool(self._default_shape_names)
 
-        if self.render_type == renderer_type.RASTERIZE:
-            self.ctx = moderngl.create_context()
-        else:
-            self.ctx = moderngl.create_context(standalone=True)
-        
-        if sys.platform != "darwin":
-            self.compute_shader_container = CustomShader(compute_shader_for_rasterization, self.ctx)
-            self.compute_shader = self.compute_shader_container.compute_shader
-            self.compute_shader["depthView"].value = False
-            self.compute_shader["heatMap"].value = False
-
-            self.blit_prog = self.ctx.program(
-                vertex_shader=glsl_vert_shader,
-                fragment_shader=glsl_frag_shader
-            )
-            self.blit_prog["tex"].value = 0
-
-            self.blit_vbo = self.ctx.buffer(np.array([
-                -1.0, -1.0,
-                1.0, -1.0,
-                -1.0,  1.0,
-                1.0,  1.0,
-            ], dtype="f4"))
-
-            self.blit_vao = self.ctx.simple_vertex_array(self.blit_prog, self.blit_vbo, "in_pos")
-        else:
-            self.compute_shader = None
-        
-        self.disable_finish_call = False # when True, increases performance, but might lead to artifacts!
-        self.tri_buffer = self.ctx.buffer(reserve=tri_dtype.itemsize * 10000)
-
-        self.texture_path = None
-        self.skybox_texture_path = None
-
-        self.texture = None
-        self.skybox_texture = None
-
-        self.render_distance = 20
-        self.rasterization_size = (width//2, height//2)
-        self.rasterization_size = (width // 2, height // 2)
-
-        rw = self.rasterization_size[0] + (16 - self.rasterization_size[0] % 16) % 16
-        rh = self.rasterization_size[1] + (16 - self.rasterization_size[1] % 16) % 16
-        self.rasterization_size = (rw, rh)
-
-        self.output_tex = self.ctx.texture((rw, rh), 4, dtype='f4')
-        self.alt = self.ctx.texture((rw, rh), 4, dtype='f4')
-        self._output_clear_rgba = np.ones((rh, rw, 4), dtype=np.float32)
-        self.upscaled_surface = pygame.Surface((self.width, self.height)).convert()
-
-        self.output_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.alt.filter = (moderngl.NEAREST, moderngl.NEAREST)
-
-        self.raster_half_w = self.rasterization_size[0] // 2
-        self.raster_half_h = self.rasterization_size[1] // 2
-
         self.entities: list[Entity] = []
 
         font_res = resources.files("aiden3drenderer").joinpath("fonts/not_a_font_but_whatever.png")
@@ -741,8 +164,7 @@ class Renderer3D:
             except Exception:
                 self.shape_material = Material("shapeMat", None, None)
                 self.shape_material = self.add_material(self.shape_material)
-
-        self.last_present_tex = self.output_tex
+                
         self.pause_img = None
         self.raster_selected = False
 
@@ -762,23 +184,15 @@ class Renderer3D:
 
         def set_render_mesh():
             self.raster_selected = False
-            if sys.platform != "darwin":
-                self.set_render_type(renderer_type.MESH)
-            else:
-                self.mac_set_render_type(renderer_type.MESH)
+            self.set_render_type(renderer_type.MESH)
 
         def set_render_fill():
             self.raster_selected = False
-            if sys.platform != "darwin":
-                self.set_render_type(renderer_type.RASTERIZE)
-            else:
-                self.mac_set_render_type(renderer_type.RASTERIZE)
+            self.set_render_type(renderer_type.RASTERIZE)
 
         def set_render_raster():
-            if sys.platform != "darwin":
-                self.set_render_type(renderer_type.RASTERIZE)
-            else:
-                self.mac_set_render_type(renderer_type.RASTERIZE)
+            self.raster_selected = True
+            self.set_render_type(renderer_type.RASTERIZE)
 
         def toggle_depth_setting():
             self.depth_view_enabled = not self.depth_view_enabled
@@ -955,29 +369,13 @@ class Renderer3D:
         # Use a list of dicts: { 'shader': CustomShader, 'inputs': [path,...] }
         self.shaders = []
 
-        if sys.platform != "darwin" and hasattr(self, 'compute_shader_container') and self.compute_shader_container:
-            cs = self.compute_shader_container
-            # Attempt to bind the renderer's tri buffer to the shader's triangle_data binding
-            tri_binding = None
-            for b in cs.buffers:
-                if b[0] == 'triangle_data':
-                    tri_binding = b[4]
-                    break
-            try:
-                if tri_binding is not None:
-                    self.tri_buffer.bind_to_storage_buffer(tri_binding)
-                    cs.buffer_objects['triangle_data'] = self.tri_buffer
-                else:
-                    cs.set_buffer('triangle_data', 10000, element_size=tri_dtype.itemsize)
-            except Exception:
-                pass
-
-            #self.shaders.append({'shader': cs, 'inputs': []})
-
-        if sys.platform == "darwin":
-            self.mac_enable_raster()
+        if sys.platform != "darwin":
+            self.backend.shaders = self.shaders
 
         self.rasterization_mult = 0.5
+
+        self.output_tex = self.backend.output_tex
+        self.alt = self.backend.alt
 
     def add_obj(self, obj, bounding_box=None):
         self.vertices_faces_list.append(obj)
@@ -1065,37 +463,13 @@ class Renderer3D:
         self.set_rasterization_size((int(self.width*self.rasterization_mult), int(self.height*self.rasterization_mult)))
 
     def set_rasterization_size(self, size: tuple[int, int]):
-        width, height = size
-        width = width + (16 - width % 16) % 16
-        height = height + (16 - height % 16) % 16
-        self.rasterization_size = (width, height)
-
-        self.raster_half_w = self.rasterization_size[0] // 2
-        self.raster_half_h = self.rasterization_size[1] // 2
-
-        if sys.platform != "darwin":
-            if self.output_tex is not None:
-                self.output_tex.release()
-            self.output_tex = self.ctx.texture((width, height), 4, dtype='f4')
-
-            if self.alt is not None:
-                self.alt.release()
-            self.alt = self.ctx.texture((width, height), 4, dtype='f4')
-
-            self.output_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-            self.alt.filter = (moderngl.NEAREST, moderngl.NEAREST)
-
-            self._output_clear_rgba = np.ones((height, width, 4), dtype=np.float32)
+        self.backend.set_rasterization_size(size)
 
     def toggle_depth_view(self, b: bool):
-        self.depth_view_enabled = b
-        if sys.platform != "darwin":
-            self.compute_shader["depthView"].value = b
+        self.backend.toggle_depth_view(b)
     
     def toggle_heat_map(self, b: bool):
-        self.heat_map_enabled = b
-        if sys.platform != "darwin":
-            self.compute_shader["heatMap"].value = b
+        self.backend.toggle_heat_map(b)
 
     def draw_pause_menu(self):
         overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
@@ -1146,115 +520,10 @@ class Renderer3D:
         self.screen.blit(fps_text, fps_text.get_rect(center=bg_rect.center))
 
     def run_compute_shaders(self, tri_count):
-        if sys.platform == 'darwin':
-            return
-
-        last_output_binding = 0
-
-        for entry in self.shaders:
-            shader = entry.get('shader')
-            if shader is None:
-                continue
-
-            # Allow shader entries to include tuple inputs for dynamic uniform updates.
-            # Format: ('uniform_name', value_or_callable)
-            # These are applied each frame before attaching textures / running the shader.
-            inputs = entry.get('inputs', [])
-            for inp in inputs:
-                if isinstance(inp, tuple) and len(inp) >= 2 and isinstance(inp[0], str):
-                    uname = inp[0]
-                    getter = inp[1]
-                    val = getter() if callable(getter) else getter
-                    try:
-                        shader.compute_shader[uname].value = val
-                    except Exception:
-                        shader.compute_shader[uname] = val
-
-            # Ensure triangle_data buffer is bound
-            for b in shader.buffers:
-                name = b[0]
-                binding = b[4]
-                if name == 'triangle_data' and name not in shader.buffer_objects:
-                    try:
-                        self.tri_buffer.bind_to_storage_buffer(binding)
-                        shader.buffer_objects[name] = self.tri_buffer
-                    except Exception:
-                        pass
-            
-            if last_output_binding == 1:
-                try:
-                    self.output_tex.bind_to_image(1, read=False, write=True)
-                except Exception:
-                    pass
-            else:
-                try:
-                    self.alt.bind_to_image(1, read=False, write=True)
-                except Exception:
-                    pass
-
-            # Also make the renderer output available as a sampler for shaders that sample the
-            # current framebuffer (bound to texture unit 2).
-            if last_output_binding == 1:
-                try:
-                    self.alt.use(location=0)
-                    try:
-                        shader.compute_shader['srcTex'].value = 0
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-            else:
-                try:
-                    self.output_tex.use(location=last_output_binding)
-                    try:
-                        shader.compute_shader['srcTex'].value = last_output_binding
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-            try:
-                shader.compute_shader['tri_count'].value = int(tri_count)
-            except Exception:
-                pass
-
-            try:
-                groups_x = max(1, (self.rasterization_size[0] + 15) // 16)
-                groups_y = max(1, (self.rasterization_size[1] + 15) // 16)
-                shader.compute_shader.run(groups_x, groups_y, 1)
-                if not self.disable_finish_call:
-                    try:
-                        self.ctx.finish()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            
-            if last_output_binding == 1:
-                self.last_present_tex = self.output_tex
-            else:
-                self.last_present_tex = self.alt
-
-            last_output_binding = (last_output_binding+1)%2
-
-        return last_output_binding
+        return self.backend.run_compute_shaders(tri_count)
 
     def capture_pause_snapshot(self):
-        if self.render_type == renderer_type.RASTERIZE:
-            self.ctx.finish()
-            rw, rh = self.rasterization_size
-            raw_data = self.last_present_tex.read()
-            img_array = np.frombuffer(raw_data, dtype='f4').reshape((rh, rw, 4))
-            img_uint8 = (np.clip(img_array, 0.0, 1.0) * 255).astype('uint8')
-            img_uint8[..., 3] = 255
-            img_uint8 = img_uint8[..., [2, 1, 0, 3]] 
-
-            image_surface = pygame.image.frombuffer(img_uint8.tobytes(), (self.rasterization_size[0], self.rasterization_size[1]), 'RGBA')
-            # Ensure the destination surface matches requested size (fixes resize bug)
-            if self.upscaled_surface.get_size() != (self.width, self.height):
-                self.upscaled_surface = pygame.Surface((self.width, self.height)).convert()
-            pygame.transform.scale(image_surface, (self.width, self.height), self.upscaled_surface)
-            self.pause_img = image_surface
+        return self.backend.capture_pause_snapshot()
 
     def signed_area_2d(self, p0, p1, p2):
         return ((p1[0] - p0[0]) * (p2[1] - p0[1])) - ((p1[1] - p0[1]) * (p2[0] - p0[0]))
@@ -1268,262 +537,25 @@ class Renderer3D:
         if self.front_face_ccw:
             return area <= 0
         return area >= 0
-
-    def set_render_type(self, type: renderer_type):
-        self.render_type = type
-        if type == renderer_type.RASTERIZE:
-            self.raster_selected = True
-            if self.resizable_window:
-                self.screen = pygame.display.set_mode((self.width, self.height), pygame.OPENGL | pygame.DOUBLEBUF, pygame.RESIZABLE)
-            else:
-                self.screen = pygame.display.set_mode((self.width, self.height), pygame.OPENGL | pygame.DOUBLEBUF)
-            self.ctx = moderngl.create_context()
-            self.disable_finish_call = False # when True, increases performance, but might lead to artifacts!
-            self.tri_buffer = self.ctx.buffer(reserve=tri_dtype.itemsize * 10000)
-
-            rw = self.rasterization_size[0] + (16 - self.rasterization_size[0] % 16) % 16
-            rh = self.rasterization_size[1] + (16 - self.rasterization_size[1] % 16) % 16
-            self.rasterization_size = (rw, rh)
-
-            self.output_tex = self.ctx.texture((rw, rh), 4, dtype='f4')
-            self.alt = self.ctx.texture((rw, rh), 4, dtype='f4')
-            self._output_clear_rgba = np.ones((rh, rw, 4), dtype=np.float32)
-            self.upscaled_surface = pygame.Surface((self.width, self.height)).convert()
-
-            self.raster_half_w = self.rasterization_size[0] // 2
-            self.raster_half_h = self.rasterization_size[1] // 2
-            self.compute_shader_container = CustomShader(compute_shader_for_rasterization, self.ctx)
-            self.compute_shader = self.compute_shader_container.compute_shader
-            self.compute_shader["depthView"].value = False
-            self.compute_shader["heatMap"].value = False
-
-            self.output_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-            self.alt.filter = (moderngl.NEAREST, moderngl.NEAREST)
-
-            self.blit_prog = self.ctx.program(
-                vertex_shader=glsl_vert_shader,
-                fragment_shader=glsl_frag_shader
-            )
-            self.blit_prog["tex"].value = 0
-
-            self.blit_vbo = self.ctx.buffer(np.array([
-                -1.0, -1.0,
-                1.0, -1.0,
-                -1.0,  1.0,
-                1.0,  1.0,
-            ], dtype="f4"))
-
-            self.blit_vao = self.ctx.simple_vertex_array(self.blit_prog, self.blit_vbo, "in_pos")
-
-            self.rebuild_textures()
-            self.rebuild_shaders()
-        else:
-            self.screen = pygame.display.set_mode((self.width, self.height))
-
-    def set_texture_for_raster(self, img_path):
-        if sys.platform != "darwin":
-            if self.texture is not None:
-                self.texture.release()
-
-            self.texture_path = img_path
-            img = Image.open(self.texture_path).convert("RGBA")
-            img_data = np.array(img, dtype='u1')
-
-            self.texture_layers = [img_data]
-            self.last_texture_array = img_data
-            self.last_size = 1
-
-            array_data = np.stack(self.texture_layers, axis=0)  # (layers, h, w, 4)
-            self.texture = self.ctx.texture_array(
-                size=(img.size[0], img.size[1], self.last_size),
-                components=4,
-                data=array_data.tobytes()
-            )
-            self.texture.use(location=1)
-            self.texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
-            self.texture.repeat_x = False
-            self.texture.repeat_y = False
-            self.compute_shader["inTex"].value = 1
-
-            self.textures = {}
-            self.textures[img_path] = len(self.texture_layers) - 1
-            return len(self.texture_layers) - 1
-
-    def add_texture_for_raster(self, img_path):
-        if sys.platform != "darwin":
-            if not self.texture_layers:
-                return self.set_texture_for_raster(img_path) 
-            
-            if img_path in self.textures:
-                return self.textures[img_path]
-
-            img = Image.open(img_path).convert("RGBA")
-            img_data = np.array(img, dtype='u1')
-
-            base_h, base_w, _ = self.texture_layers[0].shape
-            h, w, _ = img_data.shape
-            if (h, w) != (base_h, base_w):
-                img = img.resize((base_w, base_h), Image.Resampling.NEAREST)
-                img_data = np.array(img, dtype='u1')
-
-            self.texture_layers.append(img_data)
-            self.last_size = len(self.texture_layers)
-
-            if self.texture is not None:
-                self.texture.release()
-
-            array_data = np.stack(self.texture_layers, axis=0)
-            h, w = self.texture_layers[0].shape[:2]
-            self.last_size = len(self.texture_layers)
-            self.last_texture_array = img_data
-
-            if self.texture is not None:
-                self.texture.release()
-
-            array_data = np.stack(self.texture_layers, axis=0)  # (layers, h, w, 4)
-            self.texture = self.ctx.texture_array(
-                size=(w, h, self.last_size),
-                components=4,
-                data=array_data.tobytes()
-            )
-            self.texture.use(location=1)
-            self.texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
-            self.texture.repeat_x = False
-            self.texture.repeat_y = False
-            self.compute_shader["inTex"].value = 1
-
-            self.textures[img_path] = len(self.texture_layers) - 1
-            return len(self.texture_layers) -1
-    
-    def rebuild_shaders(self):
-        for entryI in range(len(self.shaders)):
-            entry = self.shaders[entryI]
-            shader: CustomShader = entry.get('shader')
-            if shader is None:
-                continue
-            # new shader
-            newShader = CustomShader(shader.shader_code, self.ctx)
-            # update the textures for the new context and shader
-            for tex in shader.texture_info:
-                newShader.add_texture(tex[0], tex[1], tex[2])
-            # update the buffers too
-            for b in shader.buffers:
-                buffer_name = b[0]
-                binding = b[4]
-                if buffer_name in shader.buffer_objects:
-                    old_buf = shader.buffer_objects[buffer_name]
-                    
-                    new_buf = self.ctx.buffer(data=old_buf.read())
-                    new_buf.bind_to_storage_buffer(binding)
-                    newShader.buffer_objects[buffer_name] = new_buf
-            self.shaders[entryI]['shader'] = newShader
-
-    def rebuild_textures(self):
-        if self.texture is not None:
-            self.texture.release()
-
-        array_data = np.stack(self.texture_layers, axis=0)
-        h, w = self.texture_layers[0].shape[:2]
-        self.last_size = len(self.texture_layers)
-
-        if self.texture is not None:
-            self.texture.release()
-
-        array_data = np.stack(self.texture_layers, axis=0)  # (layers, h, w, 4)
-        self.texture = self.ctx.texture_array(
-            size=(w, h, self.last_size),
-            components=4,
-            data=array_data.tobytes()
-        )
-        self.texture.use(location=1)
-        self.texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.texture.repeat_x = False
-        self.texture.repeat_y = False
-        self.compute_shader["inTex"].value = 1
-
-        if self.skybox_texture_path:
-            self.generate_cross_type_cubemap_skybox(20, self.skybox_texture_path)
         
     def smooth_fadeout(self, dist):
         return 0.5*(1+math.cos((1/self.render_distance)*math.pi*min(abs(dist), self.render_distance)))
 
     def generate_cubemap_skybox(self, radius: int, texture_path, left_uvs, right_uvs, top_uvs, bottom_uvs, forward_uvs, backward_uvs):
-        self.render_distance = radius
-        #uv inputs go like: op left uv, top right uv, bottom left uv, bottom right uv
-        if sys.platform != "darwin":
-            verts = np.array([(-1,-1,-1), (1,-1,-1), (-1,1,-1), (-1,-1,1), (1,1,-1), (-1,1,1), (1,-1,1), (1,1,1)])
-            verts = verts * radius
-            faces = [(0,3,2), (2,5,3), (1,4,6), (6,4,7), (0,1,2), (2,1,4), (3,5,6), (6,5,7), (0,6,1), (0,3,6), (2,4,5), (5,4,7)]
-
-            uvs = [
-                # left (0-3)
-                left_uvs[1], left_uvs[3], left_uvs[0], left_uvs[2],
-                # right (4-7)
-                right_uvs[0], right_uvs[1], right_uvs[2], right_uvs[3],
-                # backward (8-11)
-                backward_uvs[0], backward_uvs[1], backward_uvs[2], backward_uvs[3],
-                # forward (12-15)
-                forward_uvs[0], forward_uvs[1], forward_uvs[2], forward_uvs[3],
-                # bottom (16-19)
-                bottom_uvs[0], bottom_uvs[1], bottom_uvs[2], bottom_uvs[3],
-                # top (20-23)
-                top_uvs[0], top_uvs[1], top_uvs[2], top_uvs[3],
-            ]
-
-            uv_faces = [
-                (0, 2, 1), (1, 3, 2),    # left
-                (4, 6, 5), (5, 6, 7),    # right
-                (9, 8, 11), (11, 8, 10), # backward
-                (12, 14, 13), (13, 14, 15), # forward
-                (16, 19, 17), (16, 18, 19), # bottom
-                (22, 23, 20), (20, 23, 21), # top
-            ]
-
-            if self.skybox_texture is not None:
-                self.skybox_texture.release()
-            self.skybox_texture_path = texture_path
-            img = Image.open(self.skybox_texture_path).convert("RGBA")
-            img_data = np.array(img, dtype='u1')
-
-            self.skybox_texture = self.ctx.texture(img.size, 4, img_data.tobytes())
-            self.skybox_texture.use(location=2)  # bind to texture unit 0
-            self.skybox_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
-            self.skybox_texture.repeat_x = False
-            self.skybox_texture.repeat_y = False
-            self.compute_shader["skyTex"].value = 2 
-
-            self.vertices_faces_list.append([verts.tolist(),faces,uvs,uv_faces, object_type.SKYBOX, 0])
+        return self.backend.generate_cubemap_skybox(radius, texture_path, left_uvs, right_uvs, top_uvs, bottom_uvs, forward_uvs, backward_uvs)
 
     def generate_sprite_bilboard(self, material, pos=(0,0,0), size=1):
-        if sys.platform != "darwin":
-            verts = [pos] 
-            faces = [(0, 0, 0)] 
+        verts = [pos]
+        faces = [(0, 0, 0)]
 
-            uvs = [(1,1), (1,0), (0,1), (0,0)]
-            uv_faces = [(0,2,1), (3,1,2)]
+        uvs = [(1,1), (1,0), (0,1), (0,0)]
+        uv_faces = [(0,2,1), (3,1,2)]
 
-            material = self.add_material(material)
-            self.vertices_faces_list.append([verts, faces, uvs, uv_faces, object_type.BILLBOARD, material, size])
+        material = self.add_material(material)
+        self.vertices_faces_list.append([verts, faces, uvs, uv_faces, object_type.BILLBOARD, material, size])
     
     def generate_cross_type_cubemap_skybox(self, radius: int, img_path):
-        img_w, img_h = Image.open(img_path).size
-        eps_x = 1.0 / img_w
-        eps_y = 1.0 / img_h
-
-        self.generate_cubemap_skybox(radius, img_path,
-            # right: 
-            ((0.75-eps_x,   1/3+eps_y), (0.5+eps_x,     1/3+eps_y), (0.75-eps_x,   2/3-eps_y), (0.5+eps_x,     2/3-eps_y)),
-            # left:
-            ((0.25-eps_x,   1/3+eps_y), (0+eps_x,       1/3+eps_y), (0.25-eps_x,   2/3-eps_y), (0+eps_x,       2/3-eps_y)),
-            # top: 
-            ((0.5-eps_x,    1-eps_y),   (0.25+eps_x,    1-eps_y),   (0.5-eps_x,    2/3+eps_y), (0.25+eps_x,    2/3+eps_y)),
-            # bottom:
-            ((0.5-eps_x,     1/3-eps_y), (0.25+eps_x,   1/3-eps_y), (0.5-eps_x,     0+eps_y),   (0.25+eps_x,   0+eps_y)),
-            # forward:
-            ((0.75+eps_x,    1/3+eps_y), (1-eps_x,      1/3+eps_y), (0.75+eps_x,    2/3-eps_y), (1-eps_x,      2/3-eps_y)),
-            # back: 
-            ((0.25+eps_x,    1/3+eps_y), (0.5-eps_x,    1/3+eps_y), (0.25+eps_x,    2/3-eps_y), (0.5-eps_x,    2/3-eps_y)),
-        )
+        return self.backend.generate_cross_type_cubemap_skybox(radius, img_path)
 
     def normalize(self, v):
         length = math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
@@ -2118,66 +1150,10 @@ class Renderer3D:
             if n == 0:
                 return
 
-            data = np.zeros(n, dtype=tri_dtype)
-            for i, (depths, tri, uv1, uv2, uv3, light_m, is_skybox, tri_tex_index) in enumerate(all_tris):
-                p0, p1, p2 = tri
-                data[i]['pos'] = ((p0[0], p0[1]), (p1[0], p1[1]), (p2[0], p2[1]))
-                data[i]['depths'] = depths
-                if not is_skybox:
-                    if None in (uv1, uv2, uv3) or self.texture == None:
-                        data[i]['uv'] = ((-1.0, -1.0), (-1.0, -1.0), (-1.0, -1.0))
-                        data[i]['light_mult'] = 1
-                        data[i]["is_skybox"] = 0
-                        data[i]["texture_index"] = tri_tex_index
-                    else:
-                        data[i]['uv'] = (uv1, uv2, uv3)
-                        data[i]['light_mult'] = light_m
-                        data[i]["is_skybox"] = 0
-                        data[i]["texture_index"] = tri_tex_index
-                else:
-                    if None in (uv1, uv2, uv3) or self.skybox_texture == None:
-                        data[i]['uv'] = ((-1.0, -1.0), (-1.0, -1.0), (-1.0, -1.0))
-                        data[i]['light_mult'] = 1
-                        data[i]["is_skybox"] = 0
-                    else:
-                        data[i]['uv'] = (uv1, uv2, uv3)
-                        data[i]['light_mult'] = 1
-                        data[i]["is_skybox"] = 1
-                
+            self.backend.rasterize(all_tris)
+            return
 
-            self.tri_buffer.write(data.tobytes())
-            self.tri_buffer.bind_to_storage_buffer(0, offset=0, size=data.nbytes)
-
-            self.output_tex.bind_to_image(0, read=False, write=True)
-
-            self.compute_shader['tri_count'].value = n
-
-            self.output_tex.write(self._output_clear_rgba.tobytes())
-            self.alt.write(self._output_clear_rgba.tobytes())
-            self.compute_shader.run((self.rasterization_size[0] + 15) // 16, (self.rasterization_size[1] + 15) // 16)
-
-            if not self.disable_finish_call:
-                try:
-                    self.ctx.finish()
-                except Exception:
-                    pass
-
-            self.last_present_tex = self.output_tex
             
-            # n is number of triangles processed
-            last_binding = self.run_compute_shaders(n)
-
-            if last_binding == 0:
-                self.output_tex.use(location=0)
-            else:
-                self.alt.use(location=0)
-            
-            self.ctx.memory_barrier()
-
-            self.ctx.screen.use()
-            self.ctx.clear(0.0, 0.0, 0.0, 1.0)
-
-            self.blit_vao.render(moderngl.TRIANGLE_STRIP)
 
 
         elif self.render_type == renderer_type.POLYGON_FILL:
@@ -2471,15 +1447,16 @@ class Renderer3D:
         
         if len(shapesList) >= 1:
             self.shapes = shapesList
-        
-    def min_z(self, lvl1):
-        values = [
-            t[2]
-            for lvl2 in lvl1
-            for t in lvl2
-            if t is not None
-        ]
-        return max(values) if values else float("-inf")
+    
+    def set_render_type(self, type: renderer_type):
+        self.render_type = type
+        self.backend.set_render_type(type, self.screen)
+
+    def set_texture_for_raster(self, img_path):
+        self.backend.set_texture_for_raster(img_path)
+
+    def add_texture_for_raster(self, img_path):
+        return self.backend.add_texture_for_raster(img_path)
 
     def run(self):
         running = True
@@ -2594,18 +1571,12 @@ class Renderer3D:
             if self.show_pause_menu:
                 if self.pause_img is None and self.raster_selected:
                     self.capture_pause_snapshot()
-                    if sys.platform != "darwin":
-                        self.set_render_type(renderer_type.POLYGON_FILL)
-                    else:
-                        self.mac_set_render_type(renderer_type.POLYGON_FILL)
+                    self.set_render_type(renderer_type.POLYGON_FILL)
                 if self.pause_img is not None and self.raster_selected:
                     self.screen.blit(self.upscaled_surface, (0, 0))
             else:
                 if self.raster_selected and self.pause_img is not None:
-                    if sys.platform != "darwin":
-                        self.set_render_type(renderer_type.RASTERIZE)
-                    else:
-                        self.mac_set_render_type(renderer_type.RASTERIZE)
+                    self.set_render_type(renderer_type.RASTERIZE)
                 self.pause_img = None
 
             #print(self.pause_img)
@@ -2737,6 +1708,17 @@ class Renderer3D:
         self.triangle_color_list_2 = []
         self.projections_list = []
         self.projected_vertices_faces_list = []
+
+        if self.show_pause_menu:
+            if self.pause_img is None and self.raster_selected:
+                self.capture_pause_snapshot()
+                self.set_render_type(renderer_type.POLYGON_FILL)
+            if self.pause_img is not None and self.raster_selected:
+                self.screen.blit(self.upscaled_surface, (0, 0))
+        else:
+            if self.raster_selected and self.pause_img is not None:
+                self.set_render_type(renderer_type.RASTERIZE)
+            self.pause_img = None
         
         for button in self.pause_buttons:
             button.toggled = False
@@ -2755,433 +1737,6 @@ class Renderer3D:
 
         for i in ent_indexes:
             del self.vertices_faces_list[i]
-
-    def mac_barycentric(self, p, a, b, c):
-        v0 = (b[0] - a[0], b[1] - a[1])
-        v1 = (c[0] - a[0], c[1] - a[1])
-        v2 = (p[0] - a[0], p[1] - a[1])
-        denom = v0[0] * v1[1] - v0[1] * v1[0]
-        if abs(denom) < 1e-10:
-            return None
-        w1 = (v2[0] * v1[1] - v2[1] * v1[0]) / denom
-        w2 = (v0[0] * v2[1] - v0[1] * v2[0]) / denom
-        w0 = 1.0 - w1 - w2
-        return (w0, w1, w2)
-
-    def mac_sample_texture(self, u, v, is_skybox, texture_index):
-        if is_skybox:
-            tex = getattr(self, "_mac_skybox_texture", None)
-        else:
-            layers = getattr(self, "_mac_texture_layers", [])
-            if texture_index is None or texture_index < 0 or texture_index >= len(layers):
-                tex = None
-            else:
-                tex = layers[int(texture_index)]
-        if tex is None:
-            return None
-
-        h, w = tex.shape[:2]
-        uu = np.clip(u, 0.0, 1.0)
-        vv = np.clip(v, 0.0, 1.0)
-        x = min(w - 1, max(0, int(uu * (w - 1))))
-        y = min(h - 1, max(0, int(vv * (h - 1))))
-        px = tex[y, x]
-        if px.dtype != np.float32:
-            return px.astype(np.float32) / 255.0
-        return px
-
-    def mac_set_rasterization_size(self, size: tuple[int, int]):
-        width, height = size
-        width = width + (16 - width % 16) % 16
-        height = height + (16 - height % 16) % 16
-        self.rasterization_size = (width, height)
-        self.raster_half_w = self.rasterization_size[0] // 2
-        self.raster_half_h = self.rasterization_size[1] // 2
-        self._mac_output = np.ones((height, width, 4), dtype=np.float32)
-        self._mac_depth = np.full((height, width), np.inf, dtype=np.float32)
-        self._output_clear_rgba = np.ones((height, width, 4), dtype=np.float32)
-
-    def mac_toggle_depth_view(self, b: bool):
-        self.depth_view_enabled = b
-
-    def mac_toggle_heat_map(self, b: bool):
-        self.heat_map_enabled = b
-
-    def mac_set_texture_for_raster(self, img_path):
-        if img_path is None:
-            return None
-        img = Image.open(img_path).convert("RGBA")
-        img_data = np.array(img, dtype='u1')
-        self._mac_texture_layers = [img_data]
-        self._mac_textures = {img_path: 0}
-        self.texture_layers = self._mac_texture_layers
-        self.textures = self._mac_textures
-        return 0
-
-    def mac_add_texture_for_raster(self, img_path):
-        if img_path is None:
-            return None
-        if not getattr(self, "_mac_texture_layers", []):
-            return self.mac_set_texture_for_raster(img_path)
-        if img_path in self._mac_textures:
-            return self._mac_textures[img_path]
-
-        img = Image.open(img_path).convert("RGBA")
-        img_data = np.array(img, dtype='u1')
-
-        base_h, base_w, _ = self._mac_texture_layers[0].shape
-        h, w, _ = img_data.shape
-        if (h, w) != (base_h, base_w):
-            img = img.resize((base_w, base_h), Image.Resampling.NEAREST)
-            img_data = np.array(img, dtype='u1')
-
-        self._mac_texture_layers.append(img_data)
-        idx = len(self._mac_texture_layers) - 1
-        self._mac_textures[img_path] = idx
-        self.texture_layers = self._mac_texture_layers
-        self.textures = self._mac_textures
-        return idx
-
-    def mac_rebuild_textures(self):
-        # CPU textures are stored in-memory; nothing to rebuild.
-        return
-
-    def mac_generate_cubemap_skybox(self, radius: int, texture_path, left_uvs, right_uvs, top_uvs, bottom_uvs, forward_uvs, backward_uvs):
-        self.render_distance = radius
-        verts = np.array([(-1,-1,-1), (1,-1,-1), (-1,1,-1), (-1,-1,1), (1,1,-1), (-1,1,1), (1,-1,1), (1,1,1)])
-        verts = verts * radius
-        faces = [(0,3,2), (2,5,3), (1,4,6), (6,4,7), (0,1,2), (2,1,4), (3,5,6), (6,5,7), (0,6,1), (0,3,6), (2,4,5), (5,4,7)]
-
-        uvs = [
-            left_uvs[1], left_uvs[3], left_uvs[0], left_uvs[2],
-            right_uvs[0], right_uvs[1], right_uvs[2], right_uvs[3],
-            backward_uvs[0], backward_uvs[1], backward_uvs[2], backward_uvs[3],
-            forward_uvs[0], forward_uvs[1], forward_uvs[2], forward_uvs[3],
-            bottom_uvs[0], bottom_uvs[1], bottom_uvs[2], bottom_uvs[3],
-            top_uvs[0], top_uvs[1], top_uvs[2], top_uvs[3],
-        ]
-
-        uv_faces = [
-            (0, 2, 1), (1, 3, 2),
-            (4, 6, 5), (5, 6, 7),
-            (9, 8, 11), (11, 8, 10),
-            (12, 14, 13), (13, 14, 15),
-            (16, 19, 17), (16, 18, 19),
-            (22, 23, 20), (20, 23, 21),
-        ]
-
-        self.skybox_texture_path = texture_path
-        img = Image.open(self.skybox_texture_path).convert("RGBA")
-        self._mac_skybox_texture = np.array(img, dtype='u1')
-        self.vertices_faces_list.append([verts.tolist(), faces, uvs, uv_faces, object_type.SKYBOX, 0])
-
-    def mac_generate_cross_type_cubemap_skybox(self, radius: int, img_path):
-        img_w, img_h = Image.open(img_path).size
-        eps_x = 1.0 / img_w
-        eps_y = 1.0 / img_h
-        self.mac_generate_cubemap_skybox(radius, img_path,
-            ((0.75-eps_x,   1/3+eps_y), (0.5+eps_x,     1/3+eps_y), (0.75-eps_x,   2/3-eps_y), (0.5+eps_x,     2/3-eps_y)),
-            ((0.25-eps_x,   1/3+eps_y), (0+eps_x,       1/3+eps_y), (0.25-eps_x,   2/3-eps_y), (0+eps_x,       2/3-eps_y)),
-            ((0.5-eps_x,    1-eps_y),   (0.25+eps_x,    1-eps_y),   (0.5-eps_x,    2/3+eps_y), (0.25+eps_x,    2/3+eps_y)),
-            ((0.5-eps_x,     1/3-eps_y), (0.25+eps_x,   1/3-eps_y), (0.5-eps_x,     0+eps_y),   (0.25+eps_x,   0+eps_y)),
-            ((0.75+eps_x,    1/3+eps_y), (1-eps_x,      1/3+eps_y), (0.75+eps_x,    2/3-eps_y), (1-eps_x,      2/3-eps_y)),
-            ((0.25+eps_x,    1/3+eps_y), (0.5-eps_x,    1/3+eps_y), (0.25+eps_x,    2/3-eps_y), (0.5-eps_x,    2/3-eps_y)),
-        )
-
-    def mac_capture_pause_snapshot(self):
-        if self._mac_last_surface is None:
-            return
-        if self.upscaled_surface.get_size() != (self.width, self.height):
-            self.upscaled_surface = pygame.Surface((self.width, self.height)).convert()
-        pygame.transform.scale(self._mac_last_surface, (self.width, self.height), self.upscaled_surface)
-        self.pause_img = self._mac_last_surface
-
-    def mac_collect_tris(self, matrix):
-        cy, sy = math.cos(self.camera.rotation[1]), math.sin(self.camera.rotation[1])
-        cx, sx = math.cos(self.camera.rotation[0]), math.sin(self.camera.rotation[0])
-        cz, sz = math.cos(self.camera.rotation[2]), math.sin(self.camera.rotation[2])
-
-        cam_right = ( cy*cz - sy*sx*sz,  -cx*sz,  sy*cz + cy*sx*sz)
-        cam_up    = ( cy*sz + sy*sx*cz,   cx*cz,  sy*sz - cy*sx*cz)
-
-        all_tris = []
-        fov_rad = math.radians(self.camera.fov)
-
-        for matI in range(len(matrix)):
-            mat = matrix[matI]
-            if mat is None:
-                continue
-
-            vertices, faces, uv, uv_faces, obj_type, material = mat
-
-            is_skybox = obj_type == object_type.SKYBOX
-            if not is_skybox:
-                texture_index = material.texture_index if hasattr(material, "texture_index") else material
-            else:
-                texture_index = material
-            is_billboard = obj_type == object_type.BILLBOARD
-
-            if is_billboard:
-                size = self.vertices_faces_list[matI][6]
-                cx_pos = self.vertices_faces_list[matI][0][0]
-
-                hs = size * 0.5
-                tr = (cx_pos[0] + cam_right[0]*hs + cam_up[0]*hs,
-                    cx_pos[1] + cam_right[1]*hs + cam_up[1]*hs,
-                    cx_pos[2] + cam_right[2]*hs + cam_up[2]*hs)
-                br = (cx_pos[0] + cam_right[0]*hs - cam_up[0]*hs,
-                    cx_pos[1] + cam_right[1]*hs - cam_up[1]*hs,
-                    cx_pos[2] + cam_right[2]*hs - cam_up[2]*hs)
-                tl = (cx_pos[0] - cam_right[0]*hs + cam_up[0]*hs,
-                    cx_pos[1] - cam_right[1]*hs + cam_up[1]*hs,
-                    cx_pos[2] - cam_right[2]*hs + cam_up[2]*hs)
-                bl = (cx_pos[0] - cam_right[0]*hs - cam_up[0]*hs,
-                    cx_pos[1] - cam_right[1]*hs - cam_up[1]*hs,
-                    cx_pos[2] - cam_right[2]*hs - cam_up[2]*hs)
-
-                def proj_pt(p):
-                    c = self.cam(p, False)
-                    if c[2] <= 0.001:
-                        return None
-                    f = 1.0 / math.tan(fov_rad / 2)
-                    return (
-                        (c[0] * f / -c[2]) * self.raster_half_h + self.raster_half_w,
-                        (c[1] * f / -c[2]) * self.raster_half_h + self.raster_half_h,
-                        c[2]
-                    )
-
-                pp = [proj_pt(v) for v in [tr, br, tl, bl]]
-                if None in pp:
-                    continue
-                bill_uvs = [(1,1), (1,0), (0,1), (0,0)]
-                bill_tris = [(0, 2, 1), (3, 1, 2)]
-                bill_uv_faces = [(0, 2, 1), (3, 1, 2)]
-
-                for fi, (f0, f1, f2) in enumerate(bill_tris):
-                    p0, p1, p2 = pp[f0], pp[f1], pp[f2]
-                    uvi = bill_uv_faces[fi]
-                    u0, u1, u2 = bill_uvs[uvi[0]], bill_uvs[uvi[1]], bill_uvs[uvi[2]]
-                    all_tris.append(((p0[2], p1[2], p2[2]), (p0, p1, p2), u0, u1, u2, 1.0, False, texture_index))
-                continue
-
-            if self.using_obj_filetype_format and not is_billboard:
-                unprojected_verticies, *_ = self.vertices_faces_list[matI]
-
-            for faceI in range(len(faces)):
-                face = faces[faceI]
-
-                if self.using_obj_filetype_format and not is_billboard:
-                    up0 = unprojected_verticies[face[0]]
-                    up1 = unprojected_verticies[face[1]]
-                    up2 = unprojected_verticies[face[2]]
-                    if None in (up0, up1, up2):
-                        continue
-
-                uv_face = uv_faces[faceI]
-                uv0 = uv[uv_face[0]]
-                uv1 = uv[uv_face[1]]
-                uv2 = uv[uv_face[2]]
-
-                if self.using_obj_filetype_format:
-                    unprojected_normal = self.normalT_camera_space((up0, up1, up2))
-                    light_dir = np.array([0, 1, 0])
-                    light_m = max(self.lighting_strictness, np.dot(light_dir, np.array(unprojected_normal)))
-
-                    cam0, cam1, cam2 = self.cam(up0, is_skybox), self.cam(up1, is_skybox), self.cam(up2, is_skybox)
-
-                    clipped = self.clip_triangle_near([cam0, cam1, cam2], [uv0, uv1, uv2], near=0.001)
-
-                    for clipped_verts, clipped_uvs in clipped:
-                        def proj(v):
-                            f = 1.0 / math.tan(fov_rad / 2)
-                            return (
-                                (v[0] * f / -v[2]) * self.raster_half_h + self.raster_half_w,
-                                (v[1] * f / -v[2]) * self.raster_half_h + self.raster_half_h,
-                                v[2]
-                            )
-                        pp0, pp1, pp2 = proj(clipped_verts[0]), proj(clipped_verts[1]), proj(clipped_verts[2])
-                        if not is_skybox:
-                            if self.is_backface_projected(pp0, pp1, pp2):
-                                continue
-                        if is_skybox:
-                            all_tris.append(((pp0[2], pp1[2], pp2[2]), (pp0, pp1, pp2), clipped_uvs[0], clipped_uvs[1], clipped_uvs[2], light_m, is_skybox, texture_index))
-                        else:
-                            if not (abs(pp0[2]) > self.render_distance and abs(pp1[2]) > self.render_distance and abs(pp2[2]) > self.render_distance):
-                                all_tris.append(((pp0[2], pp1[2], pp2[2]), (pp0, pp1, pp2), clipped_uvs[0], clipped_uvs[1], clipped_uvs[2], light_m, is_skybox, texture_index))
-                else:
-                    p0 = vertices[face[0]]
-                    p1 = vertices[face[1]]
-                    p2 = vertices[face[2]]
-                    if None in (p0, p1, p2):
-                        continue
-                    if not (p0[2] < 0 or p1[2] < 0 or p2[2] < 0):
-                        all_tris.append(((p0[2], p1[2], p2[2]), (p0, p1, p2), uv0, uv1, uv2, 1.0, is_skybox, texture_index))
-
-        return all_tris
-
-    def mac_rasterize_tris(self, all_tris):
-        h, w = self.rasterization_size[1], self.rasterization_size[0]
-        color = self._mac_output
-        depth = self._mac_depth
-
-        color[:] = 1.0
-        depth[:] = np.inf
-
-        for depths, tri, uv1, uv2, uv3, light_m, is_skybox, tri_tex_index in all_tris:
-            p0, p1, p2 = tri
-            x0, y0 = p0[0], p0[1]
-            x1, y1 = p1[0], p1[1]
-            x2, y2 = p2[0], p2[1]
-
-            minx = max(0, int(min(x0, x1, x2)))
-            maxx = min(w - 1, int(max(x0, x1, x2)) + 1)
-            miny = max(0, int(min(y0, y1, y2)))
-            maxy = min(h - 1, int(max(y0, y1, y2)) + 1)
-
-            if maxx < minx or maxy < miny:
-                continue
-
-            inv_d0 = 1.0 / depths[0] if depths[0] != 0 else 0.0
-            inv_d1 = 1.0 / depths[1] if depths[1] != 0 else 0.0
-            inv_d2 = 1.0 / depths[2] if depths[2] != 0 else 0.0
-
-            # Vectorize barycentrics
-            yy, xx = np.mgrid[miny:maxy+1, minx:maxx+1]
-            px = xx.astype(np.float32) + 0.5
-            py = yy.astype(np.float32) + 0.5
-
-            v0x, v0y = x1 - x0, y1 - y0
-            v1x, v1y = x2 - x0, y2 - y0
-            v2x, v2y = px - x0, py - y0
-            denom = v0x * v1y - v0y * v1x
-            if abs(denom) < 1e-10:
-                continue
-            w1 = (v2x * v1y - v2y * v1x) / denom
-            w2 = (v0x * v2y - v0y * v2x) / denom
-            w0 = 1.0 - w1 - w2
-
-            valid = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
-            if not valid.any():
-                continue
-
-            d = w0 * depths[0] + w1 * depths[1] + w2 * depths[2]
-            d_valid = d < depth[yy, xx]
-            final_mask = valid & d_valid
-            if not final_mask.any():
-                continue
-
-            depth[yy[final_mask], xx[final_mask]] = d[final_mask]
-
-            if self.depth_view_enabled:
-                cc = -np.power(2, (-np.abs(d[final_mask]) * 0.75)) + 1
-                color[yy[final_mask], xx[final_mask], :3] = cc[:, np.newaxis]
-                color[yy[final_mask], xx[final_mask], 3] = 1.0
-            elif self.heat_map_enabled:
-                t = np.clip(d[final_mask] * 0.35, 0.0, 1.0)
-                color[yy[final_mask], xx[final_mask], :3] = np.column_stack([1.0 * t, np.zeros_like(t), 1.0 - t])
-                color[yy[final_mask], xx[final_mask], 3] = 1.0
-            elif uv1[0] < 0.0 or uv2[0] < 0.0 or uv3[0] < 0.0:
-                cc = -np.power(2, (-np.abs(d[final_mask]) * 0.75)) + 1
-                color[yy[final_mask], xx[final_mask], :3] = cc[:, np.newaxis]
-                color[yy[final_mask], xx[final_mask], 3] = 1.0
-            else:
-                u_num = uv1[0] * inv_d0 * w0 + uv2[0] * inv_d1 * w1 + uv3[0] * inv_d2 * w2
-                v_num = uv1[1] * inv_d0 * w0 + uv2[1] * inv_d1 * w1 + uv3[1] * inv_d2 * w2
-                w_num = inv_d0 * w0 + inv_d1 * w1 + inv_d2 * w2
-                w_valid = w_num != 0
-                final_mask = final_mask & w_valid
-                if final_mask.any():
-                    u = u_num[final_mask] / w_num[final_mask]
-                    v = 1.0 - (v_num[final_mask] / w_num[final_mask])
-
-                    if is_skybox:
-                        tex = getattr(self, "_mac_skybox_texture", None)
-                    else:
-                        layers = getattr(self, "_mac_texture_layers", [])
-                        tex = None
-                        if tri_tex_index is not None and 0 <= int(tri_tex_index) < len(layers):
-                            tex = layers[int(tri_tex_index)]
-
-                    if tex is None:
-                        cc = -np.power(2, (-np.abs(d[final_mask]) * 0.75)) + 1
-                        color[yy[final_mask], xx[final_mask], :3] = cc[:, np.newaxis]
-                        color[yy[final_mask], xx[final_mask], 3] = 1.0
-                    else:
-                        th, tw = tex.shape[:2]
-                        uu = np.clip(u, 0.0, 1.0)
-                        vv = np.clip(v, 0.0, 1.0)
-                        tx = np.clip((uu * (tw - 1)).astype(np.int32), 0, tw - 1)
-                        ty = np.clip((vv * (th - 1)).astype(np.int32), 0, th - 1)
-                        texel = tex[ty, tx]
-                        if texel.dtype != np.float32:
-                            texel = texel.astype(np.float32) / 255.0
-                        alpha = texel[:, 3:4]
-                        base = color[yy[final_mask], xx[final_mask], :3]
-                        rgb = texel[:, :3]
-                        blended = base * (1.0 - alpha) + rgb * alpha
-                        blended = blended * light_m
-                        color[yy[final_mask], xx[final_mask], :3] = blended
-                        color[yy[final_mask], xx[final_mask], 3] = 1.0
-
-        return color
-
-    def mac_render_shape_from_obj_format(self, matrix, texture_p):
-        if self.render_type != renderer_type.RASTERIZE:
-            return ORIG_RENDER_SHAPE_FROM_OBJ_FORMAT(self, matrix, texture_p)
-
-        all_tris = self.mac_collect_tris(matrix)
-        if not all_tris:
-            return
-
-        color = self.mac_rasterize_tris(all_tris)
-        img_uint8 = (np.clip(color, 0.0, 1.0) * 255).astype('uint8')
-        surface = pygame.image.frombuffer(img_uint8.tobytes(), (self.rasterization_size[0], self.rasterization_size[1]), 'RGBA')
-        if self.upscaled_surface.get_size() != (self.width, self.height):
-            self.upscaled_surface = pygame.Surface((self.width, self.height)).convert()
-        pygame.transform.scale(surface, (self.width, self.height), self.upscaled_surface)
-        self.screen.blit(self.upscaled_surface, (0, 0))
-        self._mac_last_surface = surface
-
-    def mac_set_render_type(self, type: renderer_type):
-        self.render_type = type
-        if type == renderer_type.RASTERIZE:
-            self.raster_selected = True
-            if self.resizable_window:
-                self.screen = pygame.display.set_mode((self.width, self.height), pygame.RESIZABLE)
-            else:
-                self.screen = pygame.display.set_mode((self.width, self.height))
-            self.set_rasterization_size((int(self.width * self.rasterization_mult), int(self.height * self.rasterization_mult)))
-        else:
-            self.screen = pygame.display.set_mode((self.width, self.height))
-
-    def mac_enable_raster(self):
-        if getattr(self, "_mac_raster_enabled", False):
-            return
-
-        self._mac_raster_enabled = True
-        self._mac_texture_layers = []
-        self._mac_textures = {}
-        self._mac_skybox_texture = None
-        self._mac_output = None
-        self._mac_depth = None
-        self._mac_last_surface = None
-
-        self.set_render_type = self.mac_set_render_type
-        self.set_rasterization_size = self.mac_set_rasterization_size
-        self.set_texture_for_raster = self.mac_set_texture_for_raster
-        self.add_texture_for_raster = self.mac_add_texture_for_raster
-        self.rebuild_textures = self.mac_rebuild_textures
-        self.generate_cubemap_skybox = self.mac_generate_cubemap_skybox
-        self.generate_cross_type_cubemap_skybox = self.mac_generate_cross_type_cubemap_skybox
-        self.toggle_depth_view = self.mac_toggle_depth_view
-        self.toggle_heat_map = self.mac_toggle_heat_map
-        self.capture_pause_snapshot = self.mac_capture_pause_snapshot
-        self.render_shape_from_obj_format = self.mac_render_shape_from_obj_format
-
-        if hasattr(self, "raster_button"):
-            self.raster_button.function = lambda: self.set_render_type(renderer_type.RASTERIZE)
-
-ORIG_RENDER_SHAPE_FROM_OBJ_FORMAT = Renderer3D.render_shape_from_obj_format
 
 def main():
     renderer = Renderer3D()
