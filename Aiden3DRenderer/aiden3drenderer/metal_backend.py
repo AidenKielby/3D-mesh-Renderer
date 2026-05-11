@@ -530,7 +530,7 @@ class MetalBackend(RenderBackend):
         self.cpu_depth = np.full((height, width), np.inf, dtype=np.float32)
 
         if self.renderer:
-            self.upscaled_surface = pygame.Surface((self.renderer.width, self.renderer.height)).convert()
+            self.upscaled_surface = pygame.Surface((self.renderer.width, self.renderer.height))
         self.sync_renderer_state()
 
     def set_texture_for_raster(self, img_path):
