@@ -1,7 +1,9 @@
-import moderngl
-import re
-import numpy as np
-from PIL import Image
+import sys
+if sys.platform != "darwin":
+    import moderngl
+    import re
+    import numpy as np
+    from PIL import Image
 
 glsl_type_to_bytes = {
     "float": 4,
