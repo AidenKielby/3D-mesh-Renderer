@@ -458,10 +458,10 @@ class MetalBackend(RenderBackend):
 
     def create_sampler_state(self):
         desc = MTLSamplerDescriptor.alloc().init()
-        desc.minFilter = MTLSamplerMinMagFilterNearest
-        desc.magFilter = MTLSamplerMinMagFilterNearest
-        desc.sAddressMode = MTLSamplerAddressModeClampToEdge
-        desc.tAddressMode = MTLSamplerAddressModeClampToEdge
+        desc.setMinFilter_(MTLSamplerMinMagFilterNearest)
+        desc.setMagFilter_(MTLSamplerMinMagFilterNearest)
+        desc.setSAddressMode_(MTLSamplerAddressModeClampToEdge)
+        desc.setTAddressMode_(MTLSamplerAddressModeClampToEdge)
         return self.device.newSamplerStateWithDescriptor_(desc)
 
     def create_output_texture(self, width, height):
@@ -471,8 +471,8 @@ class MetalBackend(RenderBackend):
             int(height),
             False,
         )
-        desc.storageMode = MTLStorageModeShared
-        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite
+        desc.setStorageMode_(MTLStorageModeShared)
+        desc.setUsage_(MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite)
         return self.device.newTextureWithDescriptor_(desc)
 
     def create_texture_array(self, width, height, layers):
@@ -482,10 +482,10 @@ class MetalBackend(RenderBackend):
             int(height),
             False,
         )
-        desc.textureType = MTLTextureType2DArray
-        desc.arrayLength = int(layers)
-        desc.storageMode = MTLStorageModeShared
-        desc.usage = MTLTextureUsageShaderRead
+        desc.setTextureType_(MTLTextureType2DArray)
+        desc.setArrayLength_(int(layers))
+        desc.setStorageMode_(MTLStorageModeShared)
+        desc.setUsage_(MTLTextureUsageShaderRead)
         return self.device.newTextureWithDescriptor_(desc)
 
     def create_texture_2d(self, width, height):
@@ -495,8 +495,8 @@ class MetalBackend(RenderBackend):
             int(height),
             False,
         )
-        desc.storageMode = MTLStorageModeShared
-        desc.usage = MTLTextureUsageShaderRead
+        desc.setStorageMode_(MTLStorageModeShared)
+        desc.setUsage_(MTLTextureUsageShaderRead)
         return self.device.newTextureWithDescriptor_(desc)
 
     def set_render_type(self, type: renderer_type, screen=None):
@@ -740,8 +740,12 @@ class MetalBackend(RenderBackend):
         command_buffer.commit()
         command_buffer.waitUntilCompleted()
 
+        self.last_present_tex = self.output_tex
+        self.run_compute_shaders(len(all_tris))
+
+        tex_to_present = self.last_present_tex or self.output_tex
         raw = np.empty((self.rasterization_size[1], self.rasterization_size[0], 4), dtype=np.float32)
-        self.output_tex.getBytes_bytesPerRow_fromRegion_mipmapLevel_(
+        tex_to_present.getBytes_bytesPerRow_fromRegion_mipmapLevel_(
             raw,
             bytes_per_row,
             region,
@@ -945,4 +949,53 @@ class MetalBackend(RenderBackend):
         )
 
     def run_compute_shaders(self, tri_count):
-        return
+        if not self.shaders:
+            return 0
+
+        last_output_binding = 0
+
+        for entry in self.shaders:
+            shader = entry.get('shader')
+            if shader is None:
+                continue
+
+            inputs = entry.get('inputs', [])
+            for inp in inputs:
+                if isinstance(inp, tuple) and len(inp) >= 2 and isinstance(inp[0], str):
+                    uname = inp[0]
+                    getter = inp[1]
+                    val = getter() if callable(getter) else getter
+                    try:
+                        shader.compute_shader[uname] = val
+                    except Exception:
+                        pass
+
+            if last_output_binding == 1:
+                src_tex = self.alt
+                dest_tex = self.output_tex
+            else:
+                src_tex = self.output_tex
+                dest_tex = self.alt
+
+            if src_tex is None or dest_tex is None:
+                continue
+
+            shader.textures["srcTex"] = src_tex
+            shader.textures["destTex"] = dest_tex
+
+            try:
+                shader.compute_shader["tri_count"] = int(tri_count)
+            except Exception:
+                pass
+
+            groups_x = max(1, (self.rasterization_size[0] + 15) // 16)
+            groups_y = max(1, (self.rasterization_size[1] + 15) // 16)
+            try:
+                shader.compute_shader.run(groups_x, groups_y, 1)
+            except Exception:
+                pass
+
+            self.last_present_tex = dest_tex
+            last_output_binding = (last_output_binding + 1) % 2
+
+        return last_output_binding

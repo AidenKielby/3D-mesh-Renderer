@@ -403,10 +403,20 @@ class CustomShader:
 
     def create_sampler_state(self):
         desc = MTLSamplerDescriptor.alloc().init()
-        desc.minFilter = MTLSamplerMinMagFilterNearest
-        desc.magFilter = MTLSamplerMinMagFilterNearest
-        desc.sAddressMode = MTLSamplerAddressModeClampToEdge
-        desc.tAddressMode = MTLSamplerAddressModeClampToEdge
+        try:
+            desc.minFilter = MTLSamplerMinMagFilterNearest
+            desc.magFilter = MTLSamplerMinMagFilterNearest
+            desc.sAddressMode = MTLSamplerAddressModeClampToEdge
+            desc.tAddressMode = MTLSamplerAddressModeClampToEdge
+        except AttributeError:
+            if hasattr(desc, "setMinFilter_"):
+                desc.setMinFilter_(MTLSamplerMinMagFilterNearest)
+            if hasattr(desc, "setMagFilter_"):
+                desc.setMagFilter_(MTLSamplerMinMagFilterNearest)
+            if hasattr(desc, "setSAddressMode_"):
+                desc.setSAddressMode_(MTLSamplerAddressModeClampToEdge)
+            if hasattr(desc, "setTAddressMode_"):
+                desc.setTAddressMode_(MTLSamplerAddressModeClampToEdge)
         return self.device.newSamplerStateWithDescriptor_(desc)
 
     def create_texture(self, width, height):
@@ -416,8 +426,14 @@ class CustomShader:
             int(height),
             False,
         )
-        desc.storageMode = MTLStorageModeShared
-        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite
+        try:
+            desc.storageMode = MTLStorageModeShared
+            desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite
+        except AttributeError:
+            if hasattr(desc, "setStorageMode_"):
+                desc.setStorageMode_(MTLStorageModeShared)
+            if hasattr(desc, "setUsage_"):
+                desc.setUsage_(MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite)
         return self.device.newTextureWithDescriptor_(desc)
 
     def create_default_texture(self):
