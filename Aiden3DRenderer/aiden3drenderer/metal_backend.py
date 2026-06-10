@@ -756,7 +756,7 @@ class MetalBackend(RenderBackend):
         surface = pygame.image.frombuffer(
             img_uint8.tobytes(),
             (self.rasterization_size[0], self.rasterization_size[1]),
-            "RGBA",
+            "BGRA",
         )
         if self.upscaled_surface.get_size() != (self.renderer.width, self.renderer.height):
             self.upscaled_surface = pygame.Surface((self.renderer.width, self.renderer.height)).convert()
