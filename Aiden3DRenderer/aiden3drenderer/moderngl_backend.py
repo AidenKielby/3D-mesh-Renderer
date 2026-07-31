@@ -178,6 +178,7 @@ void main() {
                                     real_col = best_color * (1-color.w) + real_col * color.w;
                                 }
                                 else{
+                                    uv = fract(uv);
                                     color = texture(inTex, vec3(uv, local_tris[j].texture_index));
                                     real_col = vec3(color.x, color.y, color.z);
                                     real_col = best_color * (1-color.w) + real_col * color.w;
