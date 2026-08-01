@@ -369,7 +369,8 @@ class Renderer3D:
         # Use a list of dicts: { 'shader': CustomShader, 'inputs': [path,...] }
         self.shaders = []
 
-        self.backend.shaders = self.shaders
+        if sys.platform != "darwin":
+            self.backend.shaders = self.shaders
 
         self.rasterization_mult = 0.5
 
