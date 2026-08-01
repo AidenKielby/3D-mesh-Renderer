@@ -217,13 +217,21 @@ kernel void main0(constant uint* spvBufferSizeConstants [[buffer(25)]], constant
                 float2 param_3 = p_center;
                 if (is_point_in_tri(param, param_1, param_2, param_3))
                 {
-                    float3 ds = float3(local_tris[j].d1, local_tris[j].d2, local_tris[j].d3);
-                    float2 param_4 = local_tris[j].pos1;
-                    float2 param_5 = local_tris[j].pos2;
-                    float2 param_6 = local_tris[j].pos3;
-                    float2 param_7 = p_center;
-                    float3 param_8 = ds;
-                    float d = depth_in_tri(param_4, param_5, param_6, param_7, param_8);
+                    float3 inv_z = float3(
+                        1.0 / local_tris[j].d1,
+                        1.0 / local_tris[j].d2,
+                        1.0 / local_tris[j].d3
+                    );
+
+                    float one_over_z = depth_in_tri(
+                        local_tris[j].pos1,
+                        local_tris[j].pos2,
+                        local_tris[j].pos3,
+                        p_center,
+                        inv_z
+                    );
+
+                    float d = 1.0 / one_over_z;
                     if (d < best_depth)
                     {
                         best_depth = d;
