@@ -139,8 +139,21 @@ void main() {
                     continue;
                 }
                 if (is_point_in_tri(local_tris[j].pos1, local_tris[j].pos2, local_tris[j].pos3, p_center)) {
-                    vec3 ds = vec3(local_tris[j].d1, local_tris[j].d2, local_tris[j].d3);
-                    float d = depth_in_tri(local_tris[j].pos1, local_tris[j].pos2, local_tris[j].pos3, p_center, ds);
+                    vec3 inv_z = vec3(
+                        1.0 / local_tris[j].d1,
+                        1.0 / local_tris[j].d2,
+                        1.0 / local_tris[j].d3
+                    );
+
+                    float one_over_z = depth_in_tri(
+                        local_tris[j].pos1,
+                        local_tris[j].pos2,
+                        local_tris[j].pos3,
+                        p_center,
+                        inv_z
+                    );
+
+                float d = 1.0 / one_over_z;
                     
                     if (d < best_depth) {
                         best_depth = d;
