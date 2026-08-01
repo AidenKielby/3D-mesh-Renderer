@@ -1145,10 +1145,6 @@ class Renderer3D:
                                 1, is_skybox, texture_index
                             ))
 
-            n = len(all_tris)
-            if n == 0:
-                return
-
             self.backend.rasterize(all_tris)
             return
 
